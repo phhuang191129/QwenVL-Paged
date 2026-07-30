@@ -118,6 +118,8 @@ public:
      * @brief Forks an existing sequence for parallel sampling.
      *
      * Physical blocks are shared until either branch writes to a shared block.
+     * Fails when the parent holds swapped-out blocks, which have no frame for a
+     * child to share; swap the parent back in first.
      */
     bool fork_sequence(SequenceId parent_id, SequenceMetadata child_metadata);
 
@@ -135,7 +137,28 @@ public:
         CacheKind cache_kind = CacheKind::TextKV);
 
     /**
+     * @brief Evicts a sequence's cache blocks to the allocator's swap backend.
+     *
+     * Blocks shared with another branch are skipped: their frame is still in use
+     * by a sibling, so reclaiming it would strand that branch.
+     *
+     * @return The number of logical blocks moved to swap.
+     */
+    std::uint32_t swap_out_sequence(SequenceId sequence_id);
+
+    /**
+     * @brief Restores a sequence's swapped-out blocks into physical frames.
+     *
+     * All-or-nothing: when the pool cannot back every swapped block, the
+     * sequence is left untouched and still swapped out.
+     */
+    bool swap_in_sequence(SequenceId sequence_id);
+
+    /**
      * @brief Releases all cache blocks owned or referenced by a sequence.
+     *
+     * Swapped-out blocks are discarded from the swap backend rather than
+     * released to the block pool, since they hold no frame.
      */
     void release_sequence(SequenceId sequence_id);
 

@@ -12,6 +12,7 @@ using SequenceId = std::uint64_t;
 using TokenPosition = std::uint32_t;
 using LogicalBlockIndex = std::uint32_t;
 using PhysicalBlockId = std::uint32_t;
+using SwapSlotId = std::uint64_t;
 
 inline constexpr std::size_t kDefaultBlockAlignmentBytes = 256;
 

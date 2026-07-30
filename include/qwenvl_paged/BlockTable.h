@@ -15,6 +15,13 @@ struct BlockTableEntry {
     LogicalBlock logical{};
     PhysicalBlockId physical_id{0};
     bool writable{true};
+    /**
+     * @brief Engaged while this block's contents live in the swap backend.
+     *
+     * The physical frame has been reclaimed, so `physical_id` is stale until the
+     * block is swapped back in and the entry is remapped.
+     */
+    std::optional<SwapSlotId> swap_slot{};
 };
 
 /**
@@ -74,6 +81,9 @@ public:
 
     /**
      * @brief Resolves a logical block index into a physical block identifier.
+     *
+     * Returns nullopt for an unmapped index and for a swapped-out block, whose
+     * frame has been reclaimed and must be swapped back in before any access.
      */
     [[nodiscard]] std::optional<PhysicalBlockId> lookup(LogicalBlockIndex index) const;
 

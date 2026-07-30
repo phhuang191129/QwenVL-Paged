@@ -1,10 +1,11 @@
 #pragma once
 
 #include "qwenvl_paged/Block.h"
-#include "qwenvl_paged/BlockTable.h"
+#include "qwenvl_paged/SwapBackend.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -28,6 +29,13 @@ struct AllocatorStats {
     std::uint32_t free_blocks{0};
     std::uint32_t active_blocks{0};
     std::uint32_t shared_blocks{0};
+    /**
+     * @brief Blocks whose contents currently live in the swap backend.
+     *
+     * These hold no physical frame, so they are counted independently of the
+     * free/active/shared frame states above.
+     */
+    std::uint32_t swapped_blocks{0};
     std::size_t bytes_reserved{0};
 };
 
@@ -47,6 +55,18 @@ struct PhysicalBlockInfo {
     std::uint64_t generation{0};
 };
 
+class MemoryAllocator;
+
+/**
+ * @brief Policy hook naming a block worth evicting under cache pressure.
+ *
+ * The selector only chooses; it must not mutate allocator state. Executing the
+ * eviction stays with whoever owns the logical mappings, because the allocator
+ * cannot know which sequence would have to be remapped.
+ */
+using EvictionCandidateSelector =
+    std::function<std::optional<PhysicalBlockId>(const MemoryAllocator&)>;
+
 /**
  * @brief Owns physical KV cache blocks and implements copy-on-write.
  *
@@ -55,8 +75,8 @@ struct PhysicalBlockInfo {
  * BlockTable and KVCacheManager while hiding free-list and refcount details.
  *
  * This phase-1 allocator is not thread-safe. All mutation must occur on the
- * engine event loop so `ensure_writable`, free-list updates, and refcount
- * transitions are observed in a deterministic order.
+ * engine event loop so free-list updates and refcount transitions are observed
+ * in a deterministic order.
  */
 class MemoryAllocator {
 public:
@@ -91,17 +111,6 @@ public:
     void retain(PhysicalBlockId id);
 
     /**
-     * @brief Ensures that a logical block table entry is privately writable.
-     *
-     * If the entry already has a single reference, it is marked writable and
-     * returned. If the physical block is shared, a new block is allocated, bytes
-     * are copied, the old reference is released, and the table is remapped.
-     */
-    [[nodiscard]] std::optional<PhysicalBlockId> ensure_writable(
-        BlockTable& table,
-        LogicalBlockIndex index);
-
-    /**
      * @brief Copies the bytes from one physical block to another.
      */
     void copy_block(PhysicalBlockId source, PhysicalBlockId destination);
@@ -122,6 +131,46 @@ public:
     [[nodiscard]] const PhysicalBlockInfo* info(PhysicalBlockId id) const noexcept;
 
     /**
+     * @brief Installs the backend that holds evicted block contents.
+     *
+     * The backend is a non-owning dependency and must outlive the allocator.
+     * Passing nullptr disables swapping.
+     */
+    void set_swap_backend(SwapBackend* backend) noexcept;
+
+    /**
+     * @brief Evicts a block's contents to the swap backend and reclaims its frame.
+     *
+     * On success the frame returns to the free list and its generation advances,
+     * so any block table still mapping this id must be repointed at the returned
+     * slot. Fails when no backend is installed, the block is free, the block is
+     * shared by more than one mapping, or the backend is full.
+     */
+    [[nodiscard]] std::optional<SwapSlotId> swap_out(PhysicalBlockId id);
+
+    /**
+     * @brief Restores a swapped slot into a newly allocated physical frame.
+     *
+     * The slot is discarded once its bytes are restored. Fails without consuming
+     * the slot when no backend is installed, the slot is unknown, or the pool has
+     * no free frame.
+     */
+    [[nodiscard]] std::optional<PhysicalBlockId> swap_in(SwapSlotId slot);
+
+    /**
+     * @brief Registers the eviction candidate selection policy.
+     */
+    void set_eviction_selector(EvictionCandidateSelector selector);
+
+    /**
+     * @brief Asks the registered policy for a block worth evicting.
+     *
+     * Advisory only: `allocate` never evicts on its own. Returns nullopt when no
+     * selector is registered or the policy names no candidate.
+     */
+    [[nodiscard]] std::optional<PhysicalBlockId> select_eviction_candidate() const;
+
+    /**
      * @brief Returns a point-in-time allocator statistics snapshot.
      */
     [[nodiscard]] AllocatorStats stats() const noexcept;
@@ -136,6 +185,8 @@ private:
     std::vector<std::unique_ptr<PhysicalBlock>> blocks_;
     std::vector<PhysicalBlockInfo> infos_;
     std::vector<PhysicalBlockId> free_list_;
+    SwapBackend* swap_backend_{nullptr};
+    EvictionCandidateSelector eviction_selector_{};
 };
 
 } // namespace qwenvl_paged

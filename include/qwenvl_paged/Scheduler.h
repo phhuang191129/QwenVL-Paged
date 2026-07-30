@@ -7,6 +7,7 @@
 #include <deque>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace qwenvl_paged {
@@ -54,6 +55,14 @@ struct SchedulerConfig {
 };
 
 /**
+ * @brief Why a request was preempted and how much cache that reclaimed.
+ */
+struct PreemptionInfo {
+    std::string reason;
+    std::uint32_t swapped_blocks{0};
+};
+
+/**
  * @brief One executable continuous-batching step.
  */
 struct BatchPlan {
@@ -97,6 +106,11 @@ public:
 
     /**
      * @brief Builds the next batch plan and updates request states.
+     *
+     * A pending request is only admitted when the cache manager can actually
+     * reserve its prompt. Under cache pressure the request stays pending and no
+     * sequence state is left behind, so a later step can admit it once blocks
+     * are reclaimed.
      */
     [[nodiscard]] BatchPlan schedule_next();
 
@@ -112,13 +126,25 @@ public:
 
     /**
      * @brief Preempts a request when cache pressure requires it.
+     *
+     * The request's cache is swapped out so its frames become available to other
+     * requests, and the reason plus the number of reclaimed blocks are recorded
+     * as preemption metadata.
      */
     bool preempt(RequestId request_id, std::string reason);
 
     /**
      * @brief Attempts to resume a previously preempted request.
+     *
+     * Fails and leaves the request preempted when the pool cannot swap its cache
+     * back in.
      */
     bool resume(RequestId request_id);
+
+    /**
+     * @brief Returns preemption metadata while a request is preempted.
+     */
+    [[nodiscard]] std::optional<PreemptionInfo> preemption_info(RequestId request_id) const;
 
     /**
      * @brief Returns the current state of a request if it is tracked.
@@ -137,6 +163,7 @@ private:
     std::deque<Request> pending_;
     std::deque<Request> active_;
     std::deque<Request> preempted_;
+    std::unordered_map<RequestId, PreemptionInfo> preemption_info_;
 };
 
 } // namespace qwenvl_paged
