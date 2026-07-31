@@ -25,6 +25,8 @@ enable_testing()
 # Core allocator library implementing the headers under include/qwenvl_paged.
 add_library(qwenvl_paged_core STATIC
     src/Block.cpp
+    src/CacheLayout.cpp
+    src/SwapBackend.cpp
     src/MemoryAllocator.cpp
     src/BlockTable.cpp
     src/KVCacheManager.cpp
@@ -43,7 +45,10 @@ gtest_discover_tests(memory_allocator_test)
 set(qwenvl_spec_tests
     Block
     BlockTable
+    CacheView
+    EndToEnd
     KVCacheManager
+    PagedAttention
     Scheduler
     SwapBackend
 )
@@ -52,3 +57,8 @@ foreach(spec IN LISTS qwenvl_spec_tests)
     target_link_libraries(${spec}_test PRIVATE qwenvl_paged_core GTest::gtest_main)
     gtest_discover_tests(${spec}_test)
 endforeach()
+
+# Latency harness for allocator, fork, copy-on-write, and scheduler costs. Not
+# registered with CTest: it reports timings rather than asserting on them.
+add_executable(qwenvl_paged_bench bench/benchmark_main.cpp)
+target_link_libraries(qwenvl_paged_bench PRIVATE qwenvl_paged_core)

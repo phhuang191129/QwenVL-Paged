@@ -18,6 +18,7 @@ flowchart TD
     BT[BlockTable<br/>logical block -> physical block mapping]
     MA[MemoryAllocator<br/>free list, ref counts, CoW,<br/>eviction hooks]
     PB[(Aligned Physical KV Blocks<br/>CPU memory today<br/>pinned/CUDA/Triton buffers later)]
+    SW[(Swap Space<br/>host memory today<br/>device migration/offload later)]
     EX[Execution Backend<br/>CPU reference kernels now<br/>CUDA/Triton later]
 
     R --> NET
@@ -28,6 +29,7 @@ flowchart TD
     KVM -- allocate/append/fork/free --> BT
     BT -- resolve logical slots --> MA
     MA -- owns/recycles --> PB
+    MA -- evict/restore block bytes --> SW
     PB -- block pointers/views --> EX
     EX -- token progress/cache writes --> KVM
     KVM -- cache pressure/status --> S
@@ -55,13 +57,23 @@ flowchart TD
   memory allocated through a small aligned allocation abstraction. Later it can
   hold pinned host memory, CUDA allocation handles, stream ownership metadata,
   or Triton buffer descriptors behind the same logical interface.
+- `SwapBackend` is the eviction store. A swapped-out block holds no frame at
+  all: swap-out copies its bytes into an opaque slot and returns the frame to
+  the free list, leaving the logical entry to remember only the slot. Swap-in
+  therefore restores into a *different* frame and remaps the entry. The CPU
+  prototype keeps slots in host memory; the same interface is meant to later
+  carry device-to-host migration or compressed/offloaded storage.
+- Eviction *policy* is separate from eviction *execution*. The allocator can
+  name a candidate through a registered callback, but never evicts inside
+  `allocate`, because only the owner of the logical mappings can remap them.
 
 ## Concurrency Contract
 
 The phase-1 allocator core is intentionally single-threaded. Network/API threads
 may receive requests asynchronously, but they must transfer ownership into the
 engine through an ingress queue. After admission, `Scheduler`, `KVCacheManager`,
-`BlockTable`, and `MemoryAllocator` are mutated only by the engine event loop.
+`BlockTable`, `MemoryAllocator`, and any installed `SwapBackend` are mutated only
+by the engine event loop.
 
 This keeps copy-on-write and reference counting deterministic while the virtual
 memory invariants are still being developed. If the allocator is later shared
@@ -69,6 +81,86 @@ across threads, `PhysicalBlockInfo::ref_count`, free-list mutation, block-table
 remapping, and `ensure_writable` must be protected by a single allocator mutex or
 converted to a carefully audited atomic protocol. Until then, these classes
 should be documented and tested as non-thread-safe engine-thread components.
+
+## KV Cache Block Layout
+
+`BlockShape` states how large a block is; `KVBlockLayout` states how elements
+are ordered inside it:
+
+```
+[layer][K|V][token_in_block][kv_head][head_dim]
+```
+
+`head_dim` is innermost, so one token's K (or V) vector for one head is
+contiguous. That is the unit the attention inner loop consumes, and the unit a
+CUDA or Triton kernel would want to issue as a single vectorized load. The K and
+V halves of a layer are separated by `stream_stride()` so a kernel can address
+them as two independent tensors sharing one allocation.
+
+`KVBlockLayout::element_offset` is bounds-checked and returns offsets in
+*elements*; multiply by `BlockShape::bytes_per_element` for a byte offset. All
+translation from a sequence-global token position to a physical slot goes
+through `CacheView::slot`, which performs the logical-to-physical lookup and
+faults on unmapped or swapped-out blocks.
+
+## Backend Integration Points
+
+`CacheView` is the whole read contract for an execution backend: the page table,
+an allocator to resolve physical block ids into storage, and the element layout.
+It exposes no writable storage on purpose. A future CUDA or Triton backend
+substitutes these pieces:
+
+- **Block storage.** `PhysicalBlock` owns aligned host bytes behind a single
+  allocation/deleter boundary. `HostMemoryOptions::prefer_pinned_memory` is the
+  hook where `cudaMallocHost`/`cudaFreeHost` or a Triton buffer provider
+  replaces `std::aligned_alloc`, with no change above `MemoryAllocator`.
+- **Block table transfer.** GPU kernels want the mapping as a flat integer
+  array rather than as a walked structure. `BlockTable::entries()` is kept
+  sorted by logical index, so a batch step can flatten it into the
+  `[num_seqs, max_blocks_per_seq]` tensor that a paged kernel indexes.
+- **Layout strides.** `KVBlockLayout`'s four strides are exactly the stride
+  arguments a Triton `tl.make_block_ptr` or a CUDA indexing helper needs. The
+  reference kernel and the device kernel must agree on them or the golden tests
+  in `tests/PagedAttention.test.cpp` no longer describe device behavior.
+- **Copy-on-write.** `MemoryAllocator::copy_block` is a `std::memcpy` today and
+  becomes a `cudaMemcpyAsync` on the engine stream. It must remain ordered
+  before any kernel that writes the copy.
+- **Eviction.** `SwapBackend` is where device-to-host migration, compression, or
+  offload attaches. `swap_out` already reclaims the frame and returns an opaque
+  slot, which is the same shape as a device eviction.
+
+### Synchronization Rules
+
+The phase-1 core is single-threaded by contract, and an asynchronous backend
+does not change that: it adds a *completion* dependency the engine must respect
+before mutating cache state.
+
+1. **Views are borrowed, not owned.** Any cache mutation (copy-on-write, swap
+   in/out, release, or reserving new blocks) can remap entries. Backends must
+   re-acquire a `CacheView` after every mutation instead of caching it across
+   steps.
+2. **Copy-on-write happens before the write is enqueued.** Call
+   `ensure_token_writable` on the engine thread first, then enqueue the kernel
+   against the returned block. A kernel must never be the thing that discovers a
+   block is shared.
+3. **A frame may not be recycled while a kernel still reads it.** `release` and
+   `swap_out` return a frame to the free list immediately, so a later `allocate`
+   can hand the same memory to another sequence. With an async backend the
+   engine must wait on that step's completion event before releasing, swapping,
+   or preempting any block the step touched.
+4. **Reference counts stay on the engine thread.** `retain`, `release`, and the
+   free list are deliberately non-atomic. They must never be called from a
+   stream callback, completion handler, or worker thread; queue the intent back
+   to the event loop instead.
+5. **Block identity is stable, block placement is not.** A `PhysicalBlockId`
+   keeps its storage for as long as it is allocated, but the *mapping* from a
+   logical block to a frame changes under copy-on-write and swap-in.
+   `PhysicalBlockInfo::generation` advances on recycle so a stale observation
+   can be detected rather than silently trusted.
+6. **Swapped-out blocks have no frame at all.** `BlockTable::lookup` and
+   `CacheView::block_bytes` return nothing for them, and
+   `paged_attention_decode` refuses the whole call rather than producing a
+   partial result. Device backends must fault the same way.
 
 ## Phased Implementation Plan
 
@@ -164,10 +256,20 @@ Verification:
 ### Week 7: Swap/Eviction Interfaces
 
 Milestones:
-- Add swap-state metadata without requiring GPU support yet.
-- Define interfaces for future host-device migration and compressed/offloaded
-  block storage.
-- Add allocator callbacks for eviction candidate selection.
+- Add per-mapping swap metadata (`BlockTableEntry::swap_slot`) so an evicted
+  logical block keeps its mapping while its physical frame is reclaimed, and
+  `BlockTable::lookup` faults instead of resolving a stale frame.
+- Define a backend-neutral eviction store (`SwapBackend`) for future host-device
+  migration and compressed/offloaded block storage, with a host-memory
+  implementation (`HostSwapBackend`) for the CPU prototype.
+- Add allocator swap primitives (`swap_out`, `swap_in`, `discard_swapped`) that
+  refuse to evict a block shared by more than one mapping, plus a sequence-level
+  all-or-nothing restore in `KVCacheManager`.
+- Add an advisory allocator callback for eviction candidate selection, keeping
+  the choice of victim separate from the remapping that executes the eviction.
+- Make scheduler preemption reclaim cache and record `PreemptionInfo`, and make
+  admission refuse a prompt the cache cannot back without leaving sequence state
+  behind.
 
 Verification:
 - Tests for preemption metadata correctness and blocked admission recovery.

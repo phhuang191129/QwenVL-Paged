@@ -158,6 +158,14 @@ public:
     [[nodiscard]] std::optional<PhysicalBlockId> swap_in(SwapSlotId slot);
 
     /**
+     * @brief Drops a swapped block's contents without restoring them.
+     *
+     * Needed when a sequence is released while some of its blocks are evicted,
+     * so finished work does not leak swap slots.
+     */
+    void discard_swapped(SwapSlotId slot);
+
+    /**
      * @brief Registers the eviction candidate selection policy.
      */
     void set_eviction_selector(EvictionCandidateSelector selector);

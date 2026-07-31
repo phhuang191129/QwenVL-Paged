@@ -51,6 +51,7 @@ void BlockTable::map(LogicalBlock logical, PhysicalBlockId physical_id, bool wri
         it->logical = logical;
         it->physical_id = physical_id;
         it->writable = writable;
+        it->swap_slot.reset();
         return;
     }
 
@@ -75,6 +76,9 @@ std::optional<PhysicalBlockId> BlockTable::unmap(LogicalBlockIndex index) {
 std::optional<PhysicalBlockId> BlockTable::lookup(LogicalBlockIndex index) const {
     auto it = lower_bound_index(entries_, index);
     if (it == entries_.end() || it->logical.index != index) {
+        return std::nullopt;
+    }
+    if (it->swap_slot.has_value()) {
         return std::nullopt;
     }
     return it->physical_id;

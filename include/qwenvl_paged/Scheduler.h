@@ -51,6 +51,13 @@ struct Request {
 struct SchedulerConfig {
     std::uint32_t max_active_requests{0};
     std::uint32_t max_batch_tokens{0};
+    /**
+     * @brief Free blocks the scheduler tries to keep in reserve after admitting.
+     *
+     * Zero disables automatic preemption entirely, leaving `preempt` purely
+     * caller-driven. Any positive value turns on the policy described on
+     * `schedule_next`.
+     */
     std::uint32_t preemption_watermark_blocks{0};
 };
 
@@ -111,6 +118,13 @@ public:
      * reserve its prompt. Under cache pressure the request stays pending and no
      * sequence state is left behind, so a later step can admit it once blocks
      * are reclaimed.
+     *
+     * When `SchedulerConfig::preemption_watermark_blocks` is positive, the
+     * scheduler also reclaims cache on its own before admitting: it preempts
+     * active requests, newest first, until the candidate's prompt plus the
+     * configured reserve fits. The newest request is chosen because the oldest
+     * is closest to finishing. The policy is demand-driven, so nothing is
+     * preempted while no request is waiting.
      */
     [[nodiscard]] BatchPlan schedule_next();
 
@@ -157,6 +171,24 @@ public:
     [[nodiscard]] std::size_t active_size() const noexcept;
 
 private:
+    /**
+     * @brief Returns how many blocks a prompt of this length occupies.
+     */
+    [[nodiscard]] std::uint32_t blocks_for_tokens(std::uint32_t token_count) const noexcept;
+
+    /**
+     * @brief Preempts active requests until a prompt plus the reserve fits.
+     *
+     * `admitted_this_step` is the number of requests already admitted by the
+     * current `schedule_next` call. Those sit at the back of the active queue
+     * and are excluded from victim selection, so a batch plan can never contain
+     * a request that the same call went on to preempt.
+     *
+     * Does nothing when the policy is disabled, when the prompt already fits, or
+     * when no amount of preemption could help.
+     */
+    void reclaim_for_admission(std::uint32_t prompt_tokens, std::size_t admitted_this_step);
+
     SchedulerConfig config_{};
     KVCacheManager* cache_manager_{nullptr};
     MemoryAllocator* allocator_{nullptr};

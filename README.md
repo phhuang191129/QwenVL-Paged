@@ -21,10 +21,21 @@ cache manager, or block-table semantics.
 - **Copy-on-write**: forked sequences share prompt blocks until one branch
   writes, at which point a private block is materialized (`KVCacheManager`).
 - **Continuous-batching scheduler** with pending/active/preempted queues,
-  admission control, and preempt/resume (`Scheduler`).
+  admission control, and preempt/resume (`Scheduler`). Set
+  `preemption_watermark_blocks` and the scheduler reclaims cache on its own,
+  preempting the newest active request until a waiting prompt plus that reserve
+  fits; leave it at zero to keep preemption caller-driven.
+- **Swap and eviction**: a preempted sequence copies its blocks into a
+  backend-neutral swap space and hands the frames back to the pool, then
+  restores them on resume (`SwapBackend`, `HostSwapBackend`). The allocator also
+  exposes an advisory eviction-candidate hook for custom policies.
 - **Multimodal-aware metadata** (M-RoPE 2D/3D positional spans, image/video
   feature spans) carried through the cache manager without changing allocator
   ownership.
+- **Reference PagedAttention**: a correctness-only CPU kernel that walks the
+  page table token by token, so scattered blocks, grouped-query heads, and
+  copy-on-write branches have a defined expected result for a future CUDA or
+  Triton kernel to reproduce (`CacheLayout`, `CacheView`, `PagedAttention`).
 
 ## Architecture
 
@@ -36,8 +47,11 @@ ownership, and KV-cache policy so each layer can evolve independently:
 | `Scheduler`        | Admission control and continuous-batching decisions.                  |
 | `KVCacheManager`   | Sequence cache lifecycle: create, reserve, fork, CoW, release.        |
 | `BlockTable`       | OS-like page table: logical block -> physical block mapping.          |
-| `MemoryAllocator`  | Owns physical blocks, free lists, ref counts, and copy-on-write.      |
+| `MemoryAllocator`  | Owns physical blocks, free lists, ref counts, CoW, and swap.          |
+| `SwapBackend`      | Holds evicted block bytes while their frame is reused.                |
 | `PhysicalBlock`    | Backend-neutral RAII-owned aligned cache block.                       |
+| `KVBlockLayout`    | Element ordering inside a block and bounds-checked slot offsets.      |
+| `CacheView`        | Read-only kernel contract: page table + storage + layout.             |
 
 For the full design, boundaries, concurrency contract, and phased plan, see
 [`docs/architecture.md`](docs/architecture.md).
@@ -52,12 +66,16 @@ For the full design, boundaries, concurrency contract, and phased plan, see
 ```
 include/qwenvl_paged/   Public headers (the API contract)
   Block.h               Core types, BlockShape, LogicalBlock, PhysicalBlock
-  MemoryAllocator.h     Physical block pool + ref counting + CoW primitives
+  CacheLayout.h         Element ordering and slot offsets inside a block
+  SwapBackend.h         Backend-neutral store for evicted block contents
+  MemoryAllocator.h     Physical block pool + ref counting + CoW + swap
   BlockTable.h          Logical-to-physical page table
-  KVCacheManager.h      Sequence cache lifecycle + multimodal metadata
+  KVCacheManager.h      Sequence cache lifecycle, multimodal metadata, CacheView
+  PagedAttention.h      Reference CPU attention over a paged cache
   Scheduler.h           Continuous-batching scheduler
 src/                    Implementations of the headers above
 tests/                  GoogleTest specification tests (one per module)
+bench/                  std::chrono latency harness for the allocator core
 docs/architecture.md    Design document and phased roadmap
 CMakeLists.txt          Build and test configuration
 ```
@@ -102,8 +120,64 @@ Or run an individual module binary directly:
 ./build/KVCacheManager_test
 ./build/BlockTable_test
 ./build/memory_allocator_test
+./build/SwapBackend_test
 ./build/Block_test
+./build/CacheView_test
+./build/PagedAttention_test
+./build/EndToEnd_test
 ```
+
+## Benchmarks
+
+`bench/` holds a dependency-free `std::chrono` harness reporting allocator
+latency, fork cost, copy-on-write cost, and scheduler throughput. It reports
+timings rather than asserting on them, so it is not registered with CTest.
+
+Build with optimizations on, or the numbers are not comparable — CMake does not
+set a build type by default:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./build/qwenvl_paged_bench
+```
+
+### Baseline Results
+
+Recorded before any Qwen3-VL inference work, to compare against after
+optimization. Setup and teardown are excluded from every measurement, so each
+row covers only the named operation.
+
+- **Machine:** AMD Ryzen 7 8845H (8 cores / 16 threads)
+- **Compiler:** GCC 15.2.1, `-O2 -std=c++17`, single-threaded
+- **Block:** 16 tokens x 8 layers x 8 kv heads x 128 dim, fp16 -> 512 KiB/block
+- **Pool:** 128 blocks (64 MiB)
+- **Figures:** median of 3 runs
+
+| Operation                           |   ns/op | ops/sec | Notes                                         |
+| ----------------------------------- | ------: | ------: | --------------------------------------------- |
+| `allocate` + `release`              |     6.4 |   157 M | Free-list pop/push, no memory touched          |
+| `fork_sequence` (8 shared blocks)   |    57.5 |    17 M | Table copy plus 8 `retain` calls, ~7 ns/block  |
+| First write to a shared block (CoW) |   7,780 |   128 K | Dominated by the 512 KiB `memcpy`              |
+| Scheduler admit + retire a request  |   161.8 |   6.2 M | Amortized enqueue, schedule, step, and cancel  |
+
+Reading these:
+
+- **Allocation is free relative to everything else.** At 6.4 ns it is a
+  free-list pop; block memory is allocated once up front by the pool.
+- **Fork is cheap enough that parallel sampling is not allocator-bound.**
+  ~7 ns per shared block is a refcount increment plus a vector copy.
+- **Copy-on-write is pure memory bandwidth**, roughly 68 GB/s for a 512 KiB
+  block. It scales linearly with block size, so it is the one number that moves
+  if the block shape changes. Reducing *how often* CoW fires matters more than
+  making the copy faster.
+- **Scheduler overhead is ~162 ns per request**, which is noise next to any real
+  model forward pass. Cache pressure, not scheduling cost, is what limits batch
+  size.
+
+These cover the allocator core only. They do not include attention compute: the
+CPU `paged_attention_decode` path is a correctness reference with no blocking or
+vectorization, so its runtime is not a meaningful optimization baseline.
 
 ## Usage
 
@@ -114,6 +188,7 @@ like this:
 #include "qwenvl_paged/MemoryAllocator.h"
 #include "qwenvl_paged/KVCacheManager.h"
 #include "qwenvl_paged/Scheduler.h"
+#include "qwenvl_paged/SwapBackend.h"
 
 using namespace qwenvl_paged;
 
@@ -127,18 +202,27 @@ int main() {
         /*head_dim*/         128,
         /*bytes_per_element*/ 2};   // e.g. fp16/bf16
     alloc_cfg.max_blocks = 1024;
-    MemoryAllocator allocator(alloc_cfg);
 
-    // 2. The cache manager owns per-sequence block tables over the allocator.
+    // 2. Optional swap space, declared before the allocator that points at it.
+    //    Without one, preemption parks a request but reclaims no blocks.
+    HostSwapBackend swap(/*max_slots*/ 1024);
+
+    MemoryAllocator allocator(alloc_cfg);
+    allocator.set_swap_backend(&swap);
+
+    // 3. The cache manager owns per-sequence block tables over the allocator.
     KVCacheManager cache(allocator);
 
-    // 3. The scheduler drives continuous batching over the cache manager.
+    // 4. The scheduler drives continuous batching over the cache manager.
     SchedulerConfig sched_cfg;
     sched_cfg.max_active_requests = 8;
     sched_cfg.max_batch_tokens    = 4096;
+    // Keep 16 blocks free after each admission, preempting to get there.
+    // Zero (the default) disables automatic preemption.
+    sched_cfg.preemption_watermark_blocks = 16;
     Scheduler scheduler(sched_cfg, cache, allocator);
 
-    // 4. Enqueue a request and step the batch loop.
+    // 5. Enqueue a request and step the batch loop.
     Request req;
     req.request_id                 = 1;
     req.root_sequence_id           = 1;
@@ -148,6 +232,8 @@ int main() {
 
     BatchPlan plan = scheduler.schedule_next();  // admits req as prefill
     scheduler.complete_step(1, /*produced_tokens*/ 1);  // prefill -> decode
+    // Under cache pressure, scheduler.preempt(1, "cache pressure") swaps this
+    // request's cache out and scheduler.resume(1) brings it back.
     // ... continue stepping, then scheduler.cancel(1) when finished.
 }
 ```
@@ -163,13 +249,32 @@ cache.fork_sequence(1, SequenceMetadata{/*sequence_id*/ 2, /*request_id*/ 1});
 auto physical = cache.ensure_token_writable(2, /*token_position*/ 0);
 ```
 
+An execution backend reads the cache through a `CacheView`, which carries the
+page table, the storage, and the element layout. `context_len` comes from the
+caller because the cache manager owns reserved capacity, not committed length:
+
+```cpp
+CacheView view = *cache.cache_view(/*sequence_id*/ 1);
+
+PagedAttentionParams params;
+params.layer            = 0;
+params.num_query_heads  = 8;    // grouped-query: 8 query heads over 2 kv heads
+params.context_len      = 32;
+params.scale            = 1.0F / std::sqrt(static_cast<float>(head_dim));
+
+// Causal prefill is this same call per prompt position with context_len = p + 1.
+bool ok = paged_attention_decode<float>(view, query.data(), params, out.data());
+```
+
 ## Project Status
 
 This is an early, actively developed prototype. The CPU allocator core,
-block-table virtual memory, copy-on-write, cache lifecycle, and scheduler are
-implemented and covered by the module tests under `tests/`. GPU/Triton backends,
-swap/eviction, and a reference PagedAttention kernel are planned; see the phased
-roadmap in [`docs/architecture.md`](docs/architecture.md).
+block-table virtual memory, copy-on-write, cache lifecycle, scheduler,
+swap/eviction interfaces, and a correctness-only reference PagedAttention path
+are implemented and covered by the module tests under `tests/`. GPU/Triton
+backends are still planned; the integration points and the synchronization
+rules they must honor are documented in
+[`docs/architecture.md`](docs/architecture.md), along with the phased roadmap.
 
 ## License
 

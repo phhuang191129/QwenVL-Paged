@@ -2,6 +2,7 @@
 
 #include "qwenvl_paged/Block.h"
 #include "qwenvl_paged/BlockTable.h"
+#include "qwenvl_paged/CacheLayout.h"
 #include "qwenvl_paged/MemoryAllocator.h"
 
 #include <cstddef>
@@ -77,13 +78,80 @@ struct SequenceMetadata {
 };
 
 /**
- * @brief Kernel-facing view of one sequence cache table.
+ * @brief Read-only, backend-neutral view of one sequence cache table.
+ *
+ * This is the whole contract an execution backend needs in order to read a
+ * paged KV cache: the page table, a way to turn a physical block id into bytes,
+ * and the element layout inside a block. It deliberately exposes no writable
+ * storage. Writes go through KVCacheManager::ensure_token_writable, which is
+ * the only path that can honor copy-on-write before a branch mutates a shared
+ * block.
+ *
+ * A view borrows the cache manager's state. It is invalidated by anything that
+ * remaps the sequence (copy-on-write, swap in/out, release), so backends must
+ * re-acquire it after every cache mutation rather than caching it across steps.
  */
 struct CacheView {
     SequenceId sequence_id{0};
     CacheKind cache_kind{CacheKind::TextKV};
     const BlockTable* block_table{nullptr};
+    const MemoryAllocator* allocator{nullptr};
+    KVBlockLayout layout{};
+
+    /**
+     * @brief Returns true when the view can resolve cache storage.
+     */
+    [[nodiscard]] bool valid() const noexcept;
+
+    /**
+     * @brief Returns the bytes backing one logical block.
+     *
+     * Returns nullptr when the logical block is unmapped or currently swapped
+     * out, so a backend faults instead of reading a recycled frame.
+     */
+    [[nodiscard]] const std::byte* block_bytes(LogicalBlockIndex index) const noexcept;
+
+    /**
+     * @brief Resolves one (stream, layer, token, kv head) vector in the cache.
+     *
+     * The returned pointer addresses `BlockShape::head_dim` contiguous elements.
+     * `token` is a sequence-global logical position; this call performs the
+     * logical-to-physical translation. Returns nullptr when `sizeof(T)` does not
+     * match the configured element size, when any coordinate is out of range, or
+     * when the containing block is unmapped or swapped out.
+     */
+    template <typename T>
+    [[nodiscard]] const T* slot(
+        KVStream stream,
+        std::uint32_t layer,
+        TokenPosition token,
+        std::uint32_t kv_head) const noexcept;
 };
+
+template <typename T>
+const T* CacheView::slot(
+    KVStream stream,
+    std::uint32_t layer,
+    TokenPosition token,
+    std::uint32_t kv_head) const noexcept {
+    if (!valid() || sizeof(T) != layout.shape.bytes_per_element) {
+        return nullptr;
+    }
+
+    const std::uint32_t tokens_per_block = layout.shape.tokens_per_block;
+    const std::optional<std::size_t> offset =
+        layout.element_offset(layer, stream, token % tokens_per_block, kv_head);
+    if (!offset.has_value()) {
+        return nullptr;
+    }
+
+    const std::byte* bytes = block_bytes(static_cast<LogicalBlockIndex>(token / tokens_per_block));
+    if (bytes == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<const T*>(bytes) + *offset;
+}
 
 /**
  * @brief Owns sequence cache lifecycle above the physical allocator.

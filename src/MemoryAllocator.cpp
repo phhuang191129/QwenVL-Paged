@@ -1,6 +1,7 @@
 #include "qwenvl_paged/MemoryAllocator.h"
 
 #include <cstring>
+#include <utility>
 
 namespace qwenvl_paged {
 
@@ -97,6 +98,76 @@ const PhysicalBlock* MemoryAllocator::block(PhysicalBlockId id) const noexcept {
     return blocks_[id].get();
 }
 
+void MemoryAllocator::set_swap_backend(SwapBackend* backend) noexcept {
+    swap_backend_ = backend;
+}
+
+std::optional<SwapSlotId> MemoryAllocator::swap_out(PhysicalBlockId id) {
+    if (swap_backend_ == nullptr || id >= infos_.size()) {
+        return std::nullopt;
+    }
+
+    PhysicalBlockInfo& info = infos_[id];
+    // A free block has nothing to evict, and a shared one is still mapped by a
+    // sibling branch that would be stranded without its frame.
+    if (info.ref_count != 1) {
+        return std::nullopt;
+    }
+
+    PhysicalBlock* frame = block(id);
+    if (frame == nullptr) {
+        return std::nullopt;
+    }
+
+    const std::optional<SwapSlotId> slot = swap_backend_->store(*frame);
+    if (!slot.has_value()) {
+        return std::nullopt;
+    }
+
+    info.ref_count = 0;
+    info.state = BlockState::Free;
+    ++info.generation;
+    free_list_.push_back(id);
+    return slot;
+}
+
+std::optional<PhysicalBlockId> MemoryAllocator::swap_in(SwapSlotId slot) {
+    if (swap_backend_ == nullptr) {
+        return std::nullopt;
+    }
+
+    const std::optional<PhysicalBlockId> id = allocate();
+    if (!id.has_value()) {
+        return std::nullopt;
+    }
+
+    PhysicalBlock* frame = block(*id);
+    if (frame == nullptr || !swap_backend_->load(slot, *frame)) {
+        release(*id);
+        return std::nullopt;
+    }
+
+    swap_backend_->discard(slot);
+    return id;
+}
+
+void MemoryAllocator::discard_swapped(SwapSlotId slot) {
+    if (swap_backend_ != nullptr) {
+        swap_backend_->discard(slot);
+    }
+}
+
+void MemoryAllocator::set_eviction_selector(EvictionCandidateSelector selector) {
+    eviction_selector_ = std::move(selector);
+}
+
+std::optional<PhysicalBlockId> MemoryAllocator::select_eviction_candidate() const {
+    if (!eviction_selector_) {
+        return std::nullopt;
+    }
+    return eviction_selector_(*this);
+}
+
 const PhysicalBlockInfo* MemoryAllocator::info(PhysicalBlockId id) const noexcept {
     if (id >= infos_.size()) {
         return nullptr;
@@ -122,6 +193,10 @@ AllocatorStats MemoryAllocator::stats() const noexcept {
             case BlockState::Swapped:
                 break;
         }
+    }
+
+    if (swap_backend_ != nullptr) {
+        stats.swapped_blocks = static_cast<std::uint32_t>(swap_backend_->resident_slots());
     }
 
     for (const std::unique_ptr<PhysicalBlock>& block : blocks_) {

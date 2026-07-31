@@ -333,5 +333,230 @@ TEST_F(SchedulerMemoryPressureTest, SimulationDrainsMixedRequestsUnderPressure) 
     EXPECT_EQ(swap_backend_.resident_slots(), 0u);
 }
 
+// --- Watermark preemption policy -----------------------------------------
+
+constexpr std::uint32_t kWatermarkPoolBlocks = 4;
+
+SchedulerConfig make_watermark_config(std::uint32_t watermark_blocks) {
+    SchedulerConfig config = make_scheduler_config();
+    config.preemption_watermark_blocks = watermark_blocks;
+    return config;
+}
+
+/**
+ * @brief Scheduler with a configurable watermark over a four-block pool.
+ *
+ * Each test picks its own watermark, so this is a plain struct rather than a
+ * fixture. `install_swap` exists because preemption can only reclaim frames
+ * when a swap backend is present.
+ */
+struct WatermarkHarness {
+    explicit WatermarkHarness(std::uint32_t watermark_blocks, bool install_swap = true)
+        : allocator(make_allocator_config(kWatermarkPoolBlocks)),
+          swap_backend(32),
+          cache_manager(allocator),
+          scheduler(make_watermark_config(watermark_blocks), cache_manager, allocator) {
+        if (install_swap) {
+            allocator.set_swap_backend(&swap_backend);
+        }
+    }
+
+    MemoryAllocator allocator;
+    HostSwapBackend swap_backend;
+    KVCacheManager cache_manager;
+    Scheduler scheduler;
+};
+
+TEST(SchedulerWatermarkTest, ZeroWatermarkLeavesAutomaticPreemptionDisabled) {
+    WatermarkHarness harness(0);
+    harness.scheduler.enqueue(make_request(1, 64)); // four blocks fills the pool
+    ASSERT_EQ(harness.scheduler.schedule_next().prefill_requests.size(), 1u);
+    ASSERT_EQ(harness.allocator.stats().free_blocks, 0u);
+
+    harness.scheduler.enqueue(make_request(2, 32));
+    const BatchPlan plan = harness.scheduler.schedule_next();
+
+    // A zero watermark keeps the Week 7 behavior: preemption stays caller-driven.
+    EXPECT_TRUE(plan.prefill_requests.empty());
+    EXPECT_EQ(harness.scheduler.state(1), RequestState::Prefill);
+    EXPECT_EQ(harness.scheduler.state(2), RequestState::Pending);
+    EXPECT_FALSE(harness.scheduler.preemption_info(1).has_value());
+}
+
+TEST(SchedulerWatermarkTest, AdmissionPreemptsAnActiveRequestToMakeRoom) {
+    WatermarkHarness harness(1);
+    harness.scheduler.enqueue(make_request(1, 32)); // two blocks
+    ASSERT_EQ(harness.scheduler.schedule_next().prefill_requests.size(), 1u);
+    ASSERT_EQ(harness.allocator.stats().free_blocks, 2u);
+
+    // Two blocks of prompt plus a one-block reserve does not fit in two frames.
+    harness.scheduler.enqueue(make_request(2, 32));
+    const BatchPlan plan = harness.scheduler.schedule_next();
+
+    ASSERT_EQ(plan.prefill_requests.size(), 1u);
+    EXPECT_EQ(plan.prefill_requests.front(), 2u);
+    EXPECT_EQ(harness.scheduler.state(1), RequestState::Preempted);
+    EXPECT_EQ(harness.scheduler.state(2), RequestState::Prefill);
+
+    const std::optional<PreemptionInfo> info = harness.scheduler.preemption_info(1);
+    ASSERT_TRUE(info.has_value());
+    EXPECT_FALSE(info->reason.empty());
+    EXPECT_EQ(info->swapped_blocks, 2u);
+}
+
+TEST(SchedulerWatermarkTest, PreemptionPicksTheNewestActiveRequest) {
+    WatermarkHarness harness(1);
+    harness.scheduler.enqueue(make_request(1, 16));
+    static_cast<void>(harness.scheduler.schedule_next());
+    harness.scheduler.enqueue(make_request(2, 16));
+    static_cast<void>(harness.scheduler.schedule_next());
+    ASSERT_EQ(harness.allocator.stats().free_blocks, 2u);
+
+    harness.scheduler.enqueue(make_request(3, 32));
+    ASSERT_EQ(harness.scheduler.schedule_next().prefill_requests.size(), 1u);
+
+    // The oldest request is closest to finishing, so the newest is evicted.
+    EXPECT_EQ(harness.scheduler.state(1), RequestState::Prefill);
+    EXPECT_EQ(harness.scheduler.state(2), RequestState::Preempted);
+    EXPECT_EQ(harness.scheduler.state(3), RequestState::Prefill);
+}
+
+TEST(SchedulerWatermarkTest, ReserveStaysFreeAfterAdmission) {
+    constexpr std::uint32_t kWatermark = 2;
+    WatermarkHarness harness(kWatermark);
+
+    harness.scheduler.enqueue(make_request(1, 32));
+    ASSERT_EQ(harness.scheduler.schedule_next().prefill_requests.size(), 1u);
+    EXPECT_GE(harness.allocator.stats().free_blocks, kWatermark);
+
+    harness.scheduler.enqueue(make_request(2, 16));
+    ASSERT_EQ(harness.scheduler.schedule_next().prefill_requests.size(), 1u);
+    EXPECT_EQ(harness.scheduler.state(1), RequestState::Preempted);
+    EXPECT_GE(harness.allocator.stats().free_blocks, kWatermark);
+}
+
+TEST(SchedulerWatermarkTest, PromptNeedingTheWholePoolStillAdmits) {
+    WatermarkHarness harness(2);
+    harness.scheduler.enqueue(make_request(1, 16));
+    static_cast<void>(harness.scheduler.schedule_next());
+    ASSERT_EQ(harness.allocator.stats().free_blocks, 3u);
+
+    // Four blocks of prompt plus a two-block reserve exceeds the whole pool.
+    // Capping the requirement at pool capacity keeps this prompt admissible
+    // instead of starving it behind a reserve that can never be satisfied.
+    harness.scheduler.enqueue(make_request(2, 64));
+    const BatchPlan plan = harness.scheduler.schedule_next();
+
+    ASSERT_EQ(plan.prefill_requests.size(), 1u);
+    EXPECT_EQ(plan.prefill_requests.front(), 2u);
+    EXPECT_EQ(harness.scheduler.state(1), RequestState::Preempted);
+    EXPECT_EQ(harness.allocator.stats().free_blocks, 0u);
+}
+
+TEST(SchedulerWatermarkTest, PromptLargerThanThePoolStaysPendingWithoutPreempting) {
+    WatermarkHarness harness(1);
+    harness.scheduler.enqueue(make_request(1, 16));
+    static_cast<void>(harness.scheduler.schedule_next());
+    ASSERT_EQ(harness.scheduler.active_size(), 1u);
+
+    // Five blocks of prompt can never fit a four-block pool. Preempting the
+    // active request would not change that, so nothing should be evicted.
+    harness.scheduler.enqueue(make_request(2, 80));
+    const BatchPlan plan = harness.scheduler.schedule_next();
+
+    EXPECT_TRUE(plan.prefill_requests.empty());
+    EXPECT_EQ(harness.scheduler.state(1), RequestState::Prefill);
+    EXPECT_EQ(harness.scheduler.state(2), RequestState::Pending);
+    EXPECT_FALSE(harness.cache_manager.contains(2));
+}
+
+TEST(SchedulerWatermarkTest, StopsPreemptingWhenPreemptionReclaimsNoBlocks) {
+    WatermarkHarness harness(1, /*install_swap=*/false);
+    // Admit one block at a time so all three are active before the pressure hits.
+    for (RequestId id = 1; id <= 3u; ++id) {
+        harness.scheduler.enqueue(make_request(id, 16));
+        ASSERT_EQ(harness.scheduler.schedule_next().prefill_requests.size(), 1u);
+    }
+    ASSERT_EQ(harness.allocator.stats().free_blocks, 1u);
+
+    harness.scheduler.enqueue(make_request(4, 32)); // two blocks plus reserve
+    const BatchPlan plan = harness.scheduler.schedule_next();
+
+    // Without a swap backend a preempted request keeps its frames, so parking
+    // requests reclaims nothing. One attempt is enough to learn that; the
+    // scheduler must not drain the whole active queue rediscovering it.
+    std::size_t preempted = 0;
+    for (RequestId id = 1; id <= 4u; ++id) {
+        if (harness.scheduler.state(id) == RequestState::Preempted) {
+            ++preempted;
+        }
+    }
+    EXPECT_EQ(preempted, 1u);
+    EXPECT_TRUE(plan.prefill_requests.empty());
+    EXPECT_EQ(harness.scheduler.state(4), RequestState::Pending);
+}
+
+TEST(SchedulerWatermarkTest, SimulationDrainsMixedRequestsWithoutManualPreemption) {
+    // The same pressure as SimulationDrainsMixedRequestsUnderPressure, except
+    // this loop never calls preempt(). Draining now depends entirely on the
+    // scheduler's own policy.
+    WatermarkHarness harness(1);
+    constexpr std::uint32_t kDecodeStepsPerRequest = 2;
+    const std::vector<std::uint32_t> prompts = {16, 48, 32, 16, 64};
+
+    std::vector<RequestId> ids;
+    for (std::size_t i = 0; i < prompts.size(); ++i) {
+        const RequestId id = static_cast<RequestId>(i + 1);
+        harness.scheduler.enqueue(make_request(id, prompts[i]));
+        ids.push_back(id);
+    }
+
+    const auto first_with_state = [&harness, &ids](RequestState wanted) -> std::optional<RequestId> {
+        for (const RequestId id : ids) {
+            if (harness.scheduler.state(id) == wanted) {
+                return id;
+            }
+        }
+        return std::nullopt;
+    };
+
+    std::unordered_map<RequestId, std::uint32_t> decode_steps;
+    std::size_t finished = 0;
+    bool scheduler_preempted = false;
+    for (int step = 0; step < 200 && finished < prompts.size(); ++step) {
+        if (!first_with_state(RequestState::Pending).has_value()) {
+            const std::optional<RequestId> preempted = first_with_state(RequestState::Preempted);
+            if (preempted.has_value()) {
+                static_cast<void>(harness.scheduler.resume(*preempted));
+            }
+        }
+
+        const BatchPlan plan = harness.scheduler.schedule_next();
+        if (first_with_state(RequestState::Preempted).has_value()) {
+            scheduler_preempted = true;
+        }
+
+        for (const RequestId id : plan.prefill_requests) {
+            harness.scheduler.complete_step(id, 1);
+        }
+        for (const RequestId id : plan.decode_requests) {
+            harness.scheduler.complete_step(id, 1);
+            if (++decode_steps[id] >= kDecodeStepsPerRequest) {
+                harness.scheduler.cancel(id);
+                ++finished;
+            }
+        }
+    }
+
+    // Nothing here calls preempt(), so any preempted request proves the policy
+    // engaged. Without this the batch would still drain (requests retire on
+    // their own) and the test would pass against an empty policy.
+    EXPECT_TRUE(scheduler_preempted);
+    EXPECT_EQ(finished, prompts.size());
+    EXPECT_EQ(harness.allocator.stats().free_blocks, kWatermarkPoolBlocks);
+    EXPECT_EQ(harness.allocator.stats().swapped_blocks, 0u);
+    EXPECT_EQ(harness.swap_backend.resident_slots(), 0u);
+}
+
 } // namespace
 } // namespace qwenvl_paged
