@@ -10,16 +10,16 @@ Qwen3-VL multimodal cache layouts without rewriting the allocator core.
 
 ```mermaid
 flowchart TD
-    R[Inference Request<br/>prompt tokens, decode budget,<br/>sampling params, multimodal metadata]
-    NET[Network / API Threads<br/>async request ingress]
-    SQ[Thread-safe Ingress Queue<br/>single ownership handoff]
-    S[Engine Event Loop<br/>Scheduler, cache mutation,<br/>admit, preempt, resume]
-    KVM[KVCacheManager<br/>sequence lifecycle, append tokens,<br/>fork for parallel sampling]
-    BT[BlockTable<br/>logical block -> physical block mapping]
-    MA[MemoryAllocator<br/>free list, ref counts, CoW,<br/>eviction hooks]
-    PB[(Aligned Physical KV Blocks<br/>CPU memory today<br/>pinned/CUDA/Triton buffers later)]
-    SW[(Swap Space<br/>host memory today<br/>device migration/offload later)]
-    EX[Execution Backend<br/>CPU reference kernels now<br/>CUDA/Triton later]
+    R["Inference Request<br/>prompt tokens, decode budget,<br/>sampling params, multimodal metadata"]
+    NET["Network / API Threads<br/>async request ingress"]
+    SQ["Thread-safe Ingress Queue<br/>single ownership handoff"]
+    S["Engine Event Loop<br/>Scheduler, cache mutation,<br/>admit, preempt, resume"]
+    KVM["KVCacheManager<br/>sequence lifecycle, append tokens,<br/>fork for parallel sampling"]
+    BT["BlockTable<br/>logical block -> physical block mapping"]
+    MA["MemoryAllocator<br/>free list, ref counts, CoW,<br/>eviction hooks"]
+    PB[("Aligned Physical KV Blocks<br/>CPU memory today<br/>pinned/CUDA/Triton buffers later")]
+    SW[("Swap Space<br/>host memory today<br/>device migration/offload later")]
+    EX["Execution Backend<br/>CPU reference kernels now<br/>CUDA/Triton later"]
 
     R --> NET
     NET --> SQ
