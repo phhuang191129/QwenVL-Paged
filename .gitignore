@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Downloaded image-dimension corpora for trace generation. The generated traces
+# under traces/*.jsonl are committed; the corpora they were drawn from are not.
+traces/.corpus/
+
+# Golden attention fixtures. The packed fixtures/*.npz are committed so the CPU
+# and GPU kernels provably validate against the same bytes; the per-array .npy
+# directories the exporter writes on the way there are not.
+fixtures/*/

@@ -1,0 +1,13 @@
+trace_mix,pixel_budget,dimension_source,mode,pool_blocks,tokens_per_block,baseline_max_context,preemption_watermark,requests,requests_admitted,requests_completed,requests_never_admissible,steps,tokens_decoded,peak_active_requests,peak_blocks_in_use,peak_bytes_in_use,utilization,max_partial_block_slack,preemptions,resumes,failed_resumes,swapped_blocks_out,forks,cow_events,head_of_line_stall_steps,fragmentation_failures,completed,leak_free
+text-only,recommended,devices,paged,960,16,8192,0,400,400,400,0,4414,33788,8,332,609222656,0.977880,15,0,0,0,0,0,0,3809,0,1,1
+text-only,recommended,devices,contiguous,960,16,8192,0,400,400,400,0,4363,33788,8,436,800063488,0.617160,516,0,0,0,0,0,0,3757,0,1,1
+image-heavy,recommended,coco,paged,616,16,8192,0,400,400,400,0,4538,34473,8,292,535822336,0.982953,15,0,0,0,0,0,0,3932,0,1,1
+image-heavy,recommended,coco,contiguous,616,16,8192,0,400,400,400,0,4488,34473,8,399,732168192,0.678169,496,0,0,0,0,0,0,3879,0,1,1
+bimodal,recommended,devices,paged,912,16,8192,0,400,400,400,0,4452,32814,8,679,1245970432,0.991105,15,0,0,0,0,0,0,3667,0,1,1
+bimodal,recommended,devices,contiguous,912,16,8192,0,400,400,400,0,4404,32814,8,770,1412956160,0.800840,502,0,0,0,0,0,0,3615,6,1,1
+image-heavy,recommended,devices,paged,1504,16,8192,0,400,400,400,0,4573,34951,8,1010,1853358080,0.994967,15,0,0,0,0,0,0,3945,0,1,1
+image-heavy,recommended,devices,contiguous,1504,16,8192,0,400,400,400,0,4523,34951,8,1086,1992818688,0.876094,485,0,0,0,0,0,0,3904,0,1,1
+repeated-prefix,recommended,devices,paged,912,16,8192,0,400,400,400,0,4259,32681,8,702,1288175616,0.993936,15,0,0,0,0,0,0,3695,0,1,1
+repeated-prefix,recommended,devices,contiguous,912,16,8192,0,400,400,400,0,4439,32681,8,792,1453326336,0.859138,506,0,0,0,0,0,0,3930,1350,1,1
+image-heavy,recommended,devices,paged,2240,16,8192,0,400,400,400,0,4573,139804,8,1133,2079064064,3.391089,15,0,0,0,0,1200,1137,3945,0,1,1
+image-heavy,recommended,devices,contiguous,2240,16,8192,0,400,400,400,0,4523,34951,8,1086,1992818688,0.876094,485,0,0,0,0,0,0,3904,0,1,1

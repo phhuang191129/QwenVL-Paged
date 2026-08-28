@@ -20,6 +20,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(googletest)
 
+# JSONL trace parsing for the replay driver.
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+)
+FetchContent_MakeAvailable(nlohmann_json)
+
 enable_testing()
 
 # Core allocator library implementing the headers under include/qwenvl_paged.
@@ -62,3 +70,22 @@ endforeach()
 # registered with CTest: it reports timings rather than asserting on them.
 add_executable(qwenvl_paged_bench bench/benchmark_main.cpp)
 target_link_libraries(qwenvl_paged_bench PRIVATE qwenvl_paged_core)
+
+# Qwen3-VL workload replay: drives the scheduler and cache manager from a trace
+# and compares against a contiguous worst-case-reservation baseline.
+add_library(qwenvl_trace_replay_core STATIC tools/trace_replay/TraceReplay.cpp)
+target_include_directories(qwenvl_trace_replay_core PUBLIC tools/trace_replay)
+target_link_libraries(qwenvl_trace_replay_core PUBLIC qwenvl_paged_core PRIVATE nlohmann_json::nlohmann_json)
+
+add_executable(qwenvl_trace_replay tools/trace_replay/main.cpp)
+target_link_libraries(qwenvl_trace_replay PRIVATE qwenvl_trace_replay_core)
+
+# Golden PagedAttention fixtures shared by the CPU reference kernel and the
+# future Triton kernel. Writes .npy arrays; pack_npz.py folds them into .npz.
+add_executable(qwenvl_golden_export tools/golden_export/main.cpp)
+target_link_libraries(qwenvl_golden_export PRIVATE qwenvl_paged_core)
+
+add_executable(TraceReplay_test tests/TraceReplay.test.cpp)
+target_link_libraries(TraceReplay_test PRIVATE qwenvl_trace_replay_core GTest::gtest_main)
+target_compile_definitions(TraceReplay_test PRIVATE QWENVL_TRACE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/traces")
+gtest_discover_tests(TraceReplay_test)

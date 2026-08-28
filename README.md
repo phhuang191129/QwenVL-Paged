@@ -76,7 +76,13 @@ include/qwenvl_paged/   Public headers (the API contract)
 src/                    Implementations of the headers above
 tests/                  GoogleTest specification tests (one per module)
 bench/                  std::chrono latency harness for the allocator core
+tools/trace_gen/        Qwen3-VL trace generator (Python, processor geometry only)
+tools/trace_replay/     Trace replay driver + contiguous-reservation baseline
+traces/                 Generated request traces (JSONL)
+results/                Measured CSV output backing docs/performance.md
 docs/architecture.md    Design document and phased roadmap
+docs/roadmap-phase2.md  Weeks 9-16: Qwen3-VL integration, profiling, optimization
+docs/performance.md     Measured results, with assumptions and limitations
 CMakeLists.txt          Build and test configuration
 ```
 
@@ -84,8 +90,11 @@ CMakeLists.txt          Build and test configuration
 
 - A C++17 compiler (GCC, Clang, or MSVC).
 - [CMake](https://cmake.org/) >= 3.16.
-- Network access on the **first** configure: GoogleTest (v1.15.2) is fetched
-  automatically via CMake `FetchContent`.
+- Network access on the **first** configure: GoogleTest (v1.15.2) and
+  nlohmann/json (v3.11.3) are fetched automatically via CMake `FetchContent`.
+- For regenerating traces only: Python 3.12 and `transformers==4.57.1`. No model
+  weights and no torch are needed. The committed traces under `traces/` mean this
+  is not required to build, test, or reproduce the measured results.
 
 ## Building
 
@@ -125,6 +134,7 @@ Or run an individual module binary directly:
 ./build/CacheView_test
 ./build/PagedAttention_test
 ./build/EndToEnd_test
+./build/TraceReplay_test
 ```
 
 ## Benchmarks
@@ -178,6 +188,51 @@ Reading these:
 These cover the allocator core only. They do not include attention compute: the
 CPU `paged_attention_decode` path is a correctness reference with no blocking or
 vectorization, so its runtime is not a meaningful optimization baseline.
+
+## Workload Replay
+
+`tools/` drives the scheduler and cache manager with real Qwen3-VL request
+geometry and compares the result against a contiguous worst-case-reservation
+allocator over an identically sized pool.
+
+Image token counts are authoritative. The generator loads no model weights and
+does not need torch: it calls `transformers`' own `smart_resize` with the patch
+and merge sizes from the model's published `preprocessor_config.json`, because an
+image's token count depends only on its source dimensions. Those dimensions come
+from COCO `test2017` metadata or a documented mix of real device capture
+resolutions. Text token counts and decode budgets are synthetic and labelled as
+such in every trace header.
+
+```bash
+# Replay the committed traces. Pool defaults to a size derived per trace.
+./build/qwenvl_trace_replay traces/bimodal.jsonl
+
+# Shrink the pool and give preemption somewhere to evict to.
+./build/qwenvl_trace_replay --pool-blocks 256 --swap-slots 256 traces/image-heavy.jsonl
+
+# Reproduce every number in docs/performance.md.
+./tools/trace_replay/run_experiments.sh
+
+# Regenerate the traces themselves (needs network on first run).
+./tools/trace_gen/generate_all.sh
+```
+
+Headline results, with full context and caveats in
+[`docs/performance.md`](docs/performance.md):
+
+- Cache utilization of **0.98-0.99** against **0.62-0.88** for the contiguous
+  baseline, with internal waste bounded at 15 of 16 token slots per sequence.
+- **Zero** admissions lost to external fragmentation, against up to 5,559 for the
+  baseline at the same pool size.
+- Effective utilization of **3.39** under 4-way parallel sampling, where branches
+  share prompt blocks until they diverge.
+- The shipped `preprocessor_config.json` permits **16,384 visual tokens for a
+  single image**, which is 1.75 GiB of KV cache on Qwen3-VL-2B; the documented
+  256-1280 token clamp brings the same image down to 140 MiB.
+- Prompt-only admission over-commits the pool, so under pressure the paged engine
+  needs preemption to finish a trace that the conservative baseline always
+  finishes. Worst-case reservation is inefficient, but it is also a safety
+  property.
 
 ## Usage
 
@@ -271,10 +326,13 @@ bool ok = paged_attention_decode<float>(view, query.data(), params, out.data());
 This is an early, actively developed prototype. The CPU allocator core,
 block-table virtual memory, copy-on-write, cache lifecycle, scheduler,
 swap/eviction interfaces, and a correctness-only reference PagedAttention path
-are implemented and covered by the module tests under `tests/`. GPU/Triton
-backends are still planned; the integration points and the synchronization
-rules they must honor are documented in
-[`docs/architecture.md`](docs/architecture.md), along with the phased roadmap.
+are implemented and covered by the module tests under `tests/`. The memory
+subsystem has been measured against real Qwen3-VL workload geometry
+([`docs/performance.md`](docs/performance.md)), but no model forward pass is
+wired up yet, so there are no latency or throughput numbers. GPU/Triton backends
+are still planned; the integration points and the synchronization rules they must
+honor are documented in [`docs/architecture.md`](docs/architecture.md), and the
+path from here is in [`docs/roadmap-phase2.md`](docs/roadmap-phase2.md).
 
 ## License
 

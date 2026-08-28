@@ -290,6 +290,12 @@ Verification:
 - Benchmark harness for allocator latency, fork cost, CoW cost, and scheduler
   throughput.
 
+### Weeks 9-16: Qwen3-VL Integration, Profiling, And Optimization
+
+Attaching the subsystem to a real model, giving it a real multimodal workload, and
+optimizing it against measured hardware limits. See
+[`roadmap-phase2.md`](roadmap-phase2.md).
+
 ## Immediate Success Criteria
 
 - The allocator can model PagedAttention as virtual block tables over physical

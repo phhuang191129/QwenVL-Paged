@@ -1,2 +1,5 @@
 -std=c++17
 -Iinclude
+-Itools/trace_replay
+-Ibuild/_deps/nlohmann_json-src/include
+-DQWENVL_TRACE_DIR="traces"
