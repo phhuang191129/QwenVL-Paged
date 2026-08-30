@@ -18,8 +18,9 @@ argument for a native paged kernel. Validating that kernel against a model is a
 separate problem from validating this cache against one.
 
 Restrictions, all deliberate and all asserted rather than silently handled:
-batch size 1, greedy decode, no beam reordering, float32. This exists to answer
-whether paged storage produces identical tokens, not to be a serving path.
+batch size 1, greedy decode, no beam reordering, one sequence per pool. This
+exists to answer whether paged storage produces identical tokens, not to be a
+serving path.
 """
 
 import numpy as np
@@ -42,24 +43,31 @@ class PagedPool:
     """
 
     def __init__(self, *, num_layers, num_kv_heads, head_dim, max_blocks,
-                 tokens_per_block=DEFAULT_TOKENS_PER_BLOCK, scatter=False):
+                 tokens_per_block=DEFAULT_TOKENS_PER_BLOCK, scatter=False,
+                 dtype=torch.float32):
         config = qp.AllocatorConfig()
         config.block_shape.tokens_per_block = tokens_per_block
         config.block_shape.num_layers = num_layers
         config.block_shape.num_kv_heads = num_kv_heads
         config.block_shape.head_dim = head_dim
-        config.block_shape.bytes_per_element = 4
+        config.block_shape.bytes_per_element = dtype.itemsize
         config.max_blocks = max_blocks
 
         self.config = config
         self.tokens_per_block = tokens_per_block
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self.dtype = dtype
 
-        self.storage = np.zeros(qp.pool_bytes_for(config) // 4, dtype=np.float32)
+        # The slab is bytes, which is what C++ thinks it is, and torch reads it
+        # through a zero-copy view at the model's dtype. Going through numpy at
+        # the element dtype instead would rule out bfloat16, which numpy has no
+        # type for and every real checkpoint here is stored in.
+        self.storage = np.zeros(qp.pool_bytes_for(config), dtype=np.uint8)
         self.allocator = qp.MemoryAllocator(config, self.storage)
         self.manager = qp.KVCacheManager(self.allocator)
-        self.frames = self.storage.reshape(max_blocks, qp.block_stride_for(config) // 4)
+        self.frames = torch.from_numpy(self.storage).view(dtype).reshape(
+            max_blocks, qp.block_stride_for(config) // dtype.itemsize)
 
         self.layout = qp.KVBlockLayout()
         self.layout.shape = config.block_shape
@@ -132,7 +140,8 @@ class PagedLayer(CacheLayerMixin):
         self.gathered_elements = 0
 
     def lazy_initialization(self, key_states, value_states):
-        assert key_states.dtype == torch.float32, "the paged pool is float32"
+        assert key_states.dtype == self.pool.dtype, (
+            f"model runs in {key_states.dtype} but the pool was sized for {self.pool.dtype}")
         assert key_states.shape[0] == 1, "PagedLayer handles batch size 1"
         self.dtype, self.device = key_states.dtype, key_states.device
         self.is_initialized = True
@@ -147,8 +156,8 @@ class PagedLayer(CacheLayerMixin):
 
         # [1, kv_heads, tokens, dim] -> [tokens, kv_heads, dim], matching the
         # in-block layout so each block is one assignment.
-        keys = key_states[0].permute(1, 0, 2).to("cpu").numpy()
-        values = value_states[0].permute(1, 0, 2).to("cpu").numpy()
+        keys = key_states[0].permute(1, 0, 2).to("cpu")
+        values = value_states[0].permute(1, 0, 2).to("cpu")
 
         tokens_per_block = self.pool.tokens_per_block
         position = start
@@ -184,12 +193,14 @@ class PagedLayer(CacheLayerMixin):
             value_blocks.append(self.pool.stream_view(frame, self.layer_idx, qp.KVStream.Value)[:count])
             remaining -= count
 
-        keys = np.concatenate(key_blocks)
-        values = np.concatenate(value_blocks)
-        self.gathered_elements += keys.size + values.size
+        keys = torch.cat(key_blocks)
+        values = torch.cat(value_blocks)
+        self.gathered_elements += keys.numel() + values.numel()
 
-        def to_model(array):
-            return torch.from_numpy(array).permute(1, 0, 2).unsqueeze(0).to(self.device, self.dtype)
+        # Concatenated on the host first so the whole context crosses to the
+        # device once per stream rather than once per block.
+        def to_model(tensor):
+            return tensor.permute(1, 0, 2).unsqueeze(0).to(self.device)
 
         return to_model(keys), to_model(values)
 
@@ -219,7 +230,7 @@ class PagedLayer(CacheLayerMixin):
 
 
 def build_paged_cache(text_config, max_blocks, tokens_per_block=DEFAULT_TOKENS_PER_BLOCK,
-                      scatter=False):
+                      scatter=False, dtype=torch.float32):
     """Returns a transformers Cache backed by one paged pool, and the pool."""
     head_dim = getattr(text_config, "head_dim", None) or (
         text_config.hidden_size // text_config.num_attention_heads)
@@ -231,6 +242,7 @@ def build_paged_cache(text_config, max_blocks, tokens_per_block=DEFAULT_TOKENS_P
         max_blocks=max_blocks,
         tokens_per_block=tokens_per_block,
         scatter=scatter,
+        dtype=dtype,
     )
     layers = [PagedLayer(pool, index) for index in range(text_config.num_hidden_layers)]
     return Cache(layers=layers), pool

@@ -41,8 +41,9 @@ cache manager, or block-table semantics.
   the same golden vectors as the CPU reference and benchmarked at the real
   Qwen3-VL-2B block shape (`tools/triton_kernel/`).
 - **Transformers cache backend**: a `CacheLayerMixin` that stores a Hugging Face
-  model's KV in allocator blocks, gated by a greedy decode that must be
-  token-identical to `DynamicCache` (`python/paged_cache.py`).
+  model's KV in allocator blocks, gated by greedy decodes that must be
+  token-identical to `DynamicCache` — on a tiny config and on the real
+  Qwen3-VL-2B with an image (`python/paged_cache.py`).
 
 ## Architecture
 
@@ -109,6 +110,10 @@ CMakeLists.txt          Build and test configuration
 - For the GPU kernel only: an NVIDIA GPU plus a Python 3.12 environment with
   torch and Triton, which `tools/triton_kernel/setup_gpu_box.sh` builds. Nothing
   in the C++ build or test suite depends on it.
+- For the paged transformers cache only: `transformers==5.16.1`, pinned because
+  the cache extension point is version-specific. The Qwen3-VL-2B gate also needs
+  torchvision, pillow, accelerate, and about 5 GB for the checkpoint; the tiny
+  gate needs none of those.
 
 ## Building
 
@@ -337,19 +342,23 @@ rather than a `Cache` subclass, which suits the block layout: a physical block
 already spans every layer, so one block table backs all of them and each
 `PagedLayer` is a window onto its own layer's stride.
 
-`python/token_identical_check.py` greedy-decodes a small random-weight Qwen3-VL
-twice, once through `DynamicCache` and once through paged blocks, and requires
-the same tokens with zero logit drift. Frames are deliberately scattered by a
-spacer sequence so a gather that ignored the block table would fail.
+Two gates decode the same prompt twice, once through `DynamicCache` and once
+through paged blocks, and require the same tokens. Frames are deliberately
+scattered by a spacer sequence, so a gather that ignored the block table fails
+both. The first runs a small random-weight config in about four seconds and also
+requires zero logit drift; the second runs the real Qwen3-VL-2B-Instruct in
+bfloat16 with a 1,242-token prompt of which 1,225 are image tokens.
 
 ```bash
 PYTHONPATH=build .venv/bin/python python/token_identical_check.py
+PYTHONPATH=build .venv/bin/python python/qwen3vl_2b_check.py
 ```
 
 This validates the memory subsystem against a real model; it does not run the
 Triton kernel. `update()` must return contiguous K/V for torch attention, so
-every step gathers the context out of its blocks — which is the cost a native
-paged kernel exists to remove. See `docs/performance.md` week 18.
+every step gathers the context out of its blocks — 137 MiB per step at that
+prompt length, about 35 ms, which is the cost a native paged kernel exists to
+remove. See `docs/performance.md` week 18.
 
 ## Usage
 
@@ -449,10 +458,10 @@ decode kernel runs on GPU, validated against the CPU golden vectors and
 benchmarked at the real block shape
 ([`docs/performance.md`](docs/performance.md)).
 
-A Qwen3-VL forward pass now runs on the paged cache and is token-identical to
-transformers' `DynamicCache`, but on random weights at a small config and with
-torch attention over gathered blocks, so there are still no end-to-end latency or
-throughput numbers and the Triton kernel is not in that path. The kernel does
+Qwen3-VL-2B-Instruct now runs on the paged cache and is token-identical to
+transformers' `DynamicCache`, image prompt included. That path uses torch
+attention over gathered blocks rather than the Triton kernel, so there are still
+no end-to-end latency or throughput numbers. The kernel does
 read a pool the allocator manages through the pybind11 module under `python/`,
 though that pool is host memory mirrored to the device rather than
 device-resident. Four of the six

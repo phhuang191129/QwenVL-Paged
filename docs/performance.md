@@ -939,16 +939,20 @@ Full suite: 153 tests pass. GPU fixture checks: 20 pass.
 ## Week 18: A Real Model On The Paged Cache
 
 Week 17 ended with the allocator and the kernel agreeing with each other and
-neither of them attached to a model. This closes half of that: a Qwen3-VL
+neither of them attached to a model. This closes half of that: Qwen3-VL
 greedy-decodes with its KV in allocator-managed blocks and produces the same
-tokens it produces with transformers' own cache. Weights are random and the
-model is two layers, so this is a gate that runs in four seconds rather than an
-end-to-end measurement.
+tokens it produces with transformers' own cache, on a two-layer random-weight
+config and on the real 2B checkpoint with an image in the prompt.
 
-Reproduce with:
+The half it does not close is the kernel, which finding 4 covers: this path uses
+torch attention over gathered blocks, so nothing here is an end-to-end
+performance result.
+
+Two gates, the first for every change and the second before believing it:
 
 ```bash
-PYTHONPATH=build .venv/bin/python python/token_identical_check.py
+PYTHONPATH=build .venv/bin/python python/token_identical_check.py   # ~4 s
+PYTHONPATH=build .venv/bin/python python/qwen3vl_2b_check.py        # ~10 s
 ```
 
 ### Finding 1: the integration point moved, and the roadmap's design is stale
@@ -1015,44 +1019,87 @@ end-to-end performance result and no timing here should be read as one.
 
 The gather's shape is the argument for finishing the job. It re-copies the
 entire context, per layer, per step, so a generation costs O(context × layers)
-per token and quadratic in tokens overall. Projecting from the 2B block shape
-(28 layers, 8 KV heads, head_dim 128, bf16) gives 112 KiB per token of context
-per step:
+per token and is quadratic in tokens overall. On the real 2B at a 1,242-token
+prompt this is measured rather than projected:
 
-| Context | Gathered per decode step | At PCIe ~10 GB/s | At device-to-device ~300 GB/s |
-| --- | --- | --- | --- |
-| 1,280 (one image prefill) | 140 MiB | ~15 ms | ~0.5 ms |
+| Quantity | Measured |
+| --- | --- |
+| Gathered per decode step | 137 MiB |
+| Gathered over 20 steps | 2.67 GiB |
+| Wall clock, 20 steps | 2.4 s paged against 1.7 s with `DynamicCache` |
+| Implied cost per step | ~35 ms |
 
-Against a measured kernel decode of tens of microseconds at these shapes, even
-the device-to-device figure is an order of magnitude more expensive than the
-attention it feeds. Those are arithmetic projections from the block shape, not
-measurements. The measured figure here is 0.60 MiB across 50 `update` calls on
-the two-layer model, which is too small to time meaningfully and is reported only
-to show the quantity is being tracked.
+Roughly 35 ms per token of pure data movement, against a kernel that decodes
+these shapes in tens of microseconds. The reference run went first and absorbed
+CUDA warm-up, so the true gap is if anything a little wider than 0.7 s. Note
+also that this is one sequence: the gather is per sequence, so batching does not
+amortize it.
+
+### Finding 5: the real 2B is token-identical too, image prompt included
+
+The tiny model cannot speak to the three things that only exist in a real
+checkpoint: 28 layers of trained weights, where one wrong KV byte compounds
+instead of washing out into noise; bfloat16 instead of float32; and a prompt
+whose bulk is image tokens produced by the vision tower and positioned by
+M-RoPE. `python/qwen3vl_2b_check.py` runs Qwen3-VL-2B-Instruct on all three.
+
+```bash
+PYTHONPATH=build .venv/bin/python python/qwen3vl_2b_check.py
+```
+
+| Property | Value |
+| --- | --- |
+| Prompt | 1,242 tokens, 1,225 of them image |
+| Geometry | 28 layers, 8 KV heads, head_dim 128, bf16 |
+| Blocks | 79 frames of 1.75 MiB, spanning ids 5-161 |
+| Result | identical text over 20 greedy steps |
+
+The 1,242-token prompt is deliberate: it is the ~1,280-token image prefill the
+block shape in week 15 was chosen against, so this exercises the geometry the
+benchmarks assume rather than a convenient small one. Both runs go through the
+same `model.generate` with the same arguments and differ only in the cache
+object, because a hand-rolled decode loop that got M-RoPE subtly wrong would
+break the comparison in a way that looks like a cache bug.
+
+The same block-table mutation was applied here and the model emits newlines
+instead of a description, diverging at the very first token.
+
+Two implementation notes fell out of running a real checkpoint. The slab is now
+`uint8` viewed at the model's dtype through torch rather than a typed numpy
+array, because numpy has no bfloat16 and every real checkpoint here is stored in
+it — the pool being bytes is also what C++ already believes. And the gather
+concatenates on the host before crossing to the device, so the context makes one
+transfer per stream per layer rather than one per block.
 
 ### Verification status
 
 | Check | Status |
 | --- | --- |
-| Tokens identical to `DynamicCache` over 24 greedy steps | pass |
-| Final-logit drift | pass, exactly 0.0 |
-| Block count matches the context length | pass, 4 blocks for 61 tokens |
+| Tiny model: tokens identical to `DynamicCache` over 24 greedy steps | pass |
+| Tiny model: final-logit drift | pass, exactly 0.0 |
+| Tiny model: block count matches the context length | pass, 4 blocks for 61 tokens |
 | Prefill spans multiple blocks, last block partially filled | pass, 37-token prefill over 3 blocks |
 | Frames physically scattered, so the gather must follow the block table | pass, `[63, 61, 59, 57]` |
 | Gate fails when the gather ignores the block table | pass, diverges at token 2 |
-| Week 17 checks still pass | pass, 153 tests and the live pool check |
+| Real Qwen3-VL-2B, bf16, 1,225 image tokens: token-identical | pass, 20 steps |
+| Real model: gate fails when the gather ignores the block table | pass, diverges at token 0 |
+| Week 17 checks still pass | pass, 153 tests, live pool check, 20 fixture checks |
 
 ### Known limitations of these numbers
 
-- **Random weights, two layers.** This gates the paging, not any checkpoint. A
-  real model can still fail on things this cannot see: M-RoPE position handling,
-  the vision tower's contribution to the prefill, and bf16 rather than fp32.
-- **No image.** The prompt is text tokens. The vision path is configured but
-  never exercised, so nothing here covers the long image prefill that motivates
-  the block shape in the first place.
-- **Batch size 1, greedy, fp32, single sequence.** All four are asserted rather
-  than handled. In particular there is no fork here, so prompt sharing across
-  sampling branches — the thing paging exists to make cheap — is still unmeasured.
-- **The gather is the path, not the kernel.** Stated above and worth repeating:
-  no number in this section reflects the Triton kernel, because the Triton kernel
-  does not run in it.
+- **Batch size 1, greedy, single sequence.** All three are asserted rather than
+  handled. In particular there is no fork in either gate, so prompt sharing
+  across sampling branches — the thing paging exists to make cheap — is still
+  unmeasured, and the RSS comparison the roadmap asks for has not been run.
+- **The gather is the path, not the kernel.** No number in this section reflects
+  the Triton kernel, because the Triton kernel does not run in it. The 35 ms per
+  step is the cost of *not* having it in the path.
+- **The pool is still host memory.** Every gather crosses PCIe. A device-resident
+  pool would cut that cost substantially without removing it, and is still
+  blocked on the three host dereferences from week 17 finding 5.
+- **Twenty tokens, one prompt, one image.** Enough to catch a systematic paging
+  error, which is what it is for. It is not a sweep, and nothing here varies
+  context length, image size, or generation length.
+- **No throughput or latency claim.** The wall-clock figures compare two
+  correctness harnesses on one sequence. They bound the gather cost; they are not
+  a serving measurement.

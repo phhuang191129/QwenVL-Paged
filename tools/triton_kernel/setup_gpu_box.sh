@@ -27,8 +27,11 @@ command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 
 uv venv --allow-existing --python 3.12 .venv
+# torchvision, pillow, and accelerate are only needed by the Qwen3-VL-2B gate:
+# the image processor refuses to load without torchvision, and the checkpoint
+# needs accelerate to place weights on the device.
 uv pip install --python .venv/bin/python "numpy==${NUMPY_VERSION}" "torch==${TORCH_VERSION}" \
-    "transformers==${TRANSFORMERS_VERSION}"
+    "transformers==${TRANSFORMERS_VERSION}" torchvision pillow accelerate
 
 .venv/bin/python -c "
 import torch
