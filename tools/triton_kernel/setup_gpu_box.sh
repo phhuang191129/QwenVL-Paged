@@ -16,11 +16,19 @@ cd "$(dirname "$0")/../.."
 TORCH_VERSION=2.13.0
 NUMPY_VERSION=2.5.2
 
+# transformers is pinned harder than the rest. python/paged_cache.py implements
+# a `CacheLayerMixin`, and that extension point is version-specific: 4.x had a
+# monolithic `Cache` to subclass, 5.x replaced it with one layer object per
+# decoder layer. An unpinned upgrade would not fail to import, it would fail the
+# token-identical gate, which is a much worse way to find out.
+TRANSFORMERS_VERSION=5.16.1
+
 command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 
 uv venv --allow-existing --python 3.12 .venv
-uv pip install --python .venv/bin/python "numpy==${NUMPY_VERSION}" "torch==${TORCH_VERSION}"
+uv pip install --python .venv/bin/python "numpy==${NUMPY_VERSION}" "torch==${TORCH_VERSION}" \
+    "transformers==${TRANSFORMERS_VERSION}"
 
 .venv/bin/python -c "
 import torch

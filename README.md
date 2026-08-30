@@ -40,6 +40,9 @@ cache manager, or block-table semantics.
   `KVBlockLayout`'s four strides and the flattened block table, validated against
   the same golden vectors as the CPU reference and benchmarked at the real
   Qwen3-VL-2B block shape (`tools/triton_kernel/`).
+- **Transformers cache backend**: a `CacheLayerMixin` that stores a Hugging Face
+  model's KV in allocator blocks, gated by a greedy decode that must be
+  token-identical to `DynamicCache` (`python/paged_cache.py`).
 
 ## Architecture
 
@@ -84,7 +87,7 @@ tools/trace_gen/        Qwen3-VL trace generator (Python, processor geometry onl
 tools/trace_replay/     Trace replay driver + contiguous-reservation baseline
 tools/golden_export/    Golden fixture exporter and its pre-GPU verification gate
 tools/triton_kernel/    Triton decode kernel, fixture runner, and GPU benchmark
-python/                 pybind11 bindings and the live allocator-to-kernel check
+python/                 pybind11 bindings, the transformers cache, and their checks
 traces/                 Generated request traces (JSONL)
 fixtures/               Golden attention vectors (.npz) shared by both backends
 results/                Measured CSV output backing docs/performance.md
@@ -326,6 +329,28 @@ The pool is still host memory mirrored per run rather than device-resident.
 frame bytes on the host, so adopting device memory needs those three sites to
 take a copy hook first — the bookkeeping itself already touches no bytes.
 
+## Paged Cache For Transformers
+
+`python/paged_cache.py` backs a Hugging Face model's KV cache with the allocator.
+In transformers 5.x the extension point is a `CacheLayerMixin` per decoder layer
+rather than a `Cache` subclass, which suits the block layout: a physical block
+already spans every layer, so one block table backs all of them and each
+`PagedLayer` is a window onto its own layer's stride.
+
+`python/token_identical_check.py` greedy-decodes a small random-weight Qwen3-VL
+twice, once through `DynamicCache` and once through paged blocks, and requires
+the same tokens with zero logit drift. Frames are deliberately scattered by a
+spacer sequence so a gather that ignored the block table would fail.
+
+```bash
+PYTHONPATH=build .venv/bin/python python/token_identical_check.py
+```
+
+This validates the memory subsystem against a real model; it does not run the
+Triton kernel. `update()` must return contiguous K/V for torch attention, so
+every step gathers the context out of its blocks — which is the cost a native
+paged kernel exists to remove. See `docs/performance.md` week 18.
+
 ## Usage
 
 The library exposes three cooperating objects. A minimal end-to-end setup looks
@@ -424,10 +449,13 @@ decode kernel runs on GPU, validated against the CPU golden vectors and
 benchmarked at the real block shape
 ([`docs/performance.md`](docs/performance.md)).
 
-No model forward pass is wired up yet, so there are no end-to-end latency or
-throughput numbers. The Triton kernel does now read a pool the allocator manages
-through the pybind11 module under `python/`, though that pool is host memory
-mirrored to the device rather than device-resident. Four of the six
+A Qwen3-VL forward pass now runs on the paged cache and is token-identical to
+transformers' `DynamicCache`, but on random weights at a small config and with
+torch attention over gathered blocks, so there are still no end-to-end latency or
+throughput numbers and the Triton kernel is not in that path. The kernel does
+read a pool the allocator manages through the pybind11 module under `python/`,
+though that pool is host memory mirrored to the device rather than
+device-resident. Four of the six
 synchronization rules in
 [`docs/architecture.md`](docs/architecture.md) are exercised by
 `tests/SynchronizationRules.test.cpp`; the remaining two govern an asynchronous

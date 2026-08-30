@@ -935,3 +935,124 @@ Full suite: 153 tests pass. GPU fixture checks: 20 pass.
   backend is asynchronous, and they are the two with no test.
 - **Still no model.** This connects the allocator to the kernel, not either to
   Qwen3-VL. There is still no end-to-end number and no token-identical gate.
+
+## Week 18: A Real Model On The Paged Cache
+
+Week 17 ended with the allocator and the kernel agreeing with each other and
+neither of them attached to a model. This closes half of that: a Qwen3-VL
+greedy-decodes with its KV in allocator-managed blocks and produces the same
+tokens it produces with transformers' own cache. Weights are random and the
+model is two layers, so this is a gate that runs in four seconds rather than an
+end-to-end measurement.
+
+Reproduce with:
+
+```bash
+PYTHONPATH=build .venv/bin/python python/token_identical_check.py
+```
+
+### Finding 1: the integration point moved, and the roadmap's design is stale
+
+`docs/roadmap-phase2.md` week 13 says to subclass the `Cache` interface in
+`cache_utils.py` and override `update()`. That was right for transformers 4.x.
+Version 5 restructured `Cache` into a container of per-layer objects, so `Cache`
+itself is now plumbing and the thing to implement is a `CacheLayerMixin` — one
+object per decoder layer, dispatched to by `layers[layer_idx].update(...)`.
+
+The replacement fits the block layout better than the thing it replaced. A
+physical block already spans every layer, so one sequence's block table backs all
+layers at once and a `PagedLayer` is just a window onto its own layer's stride
+within the same frames. The required surface is six methods, and the reference
+implementation to work against, `DynamicLayer.update`, is two `torch.cat` calls.
+
+This is the API the roadmap warned would move, and it moved. The pin in
+`setup_gpu_box.sh` is now `transformers==5.16.1`, tightened deliberately: a
+silent upgrade would not fail to import, it would fail the token-identical gate.
+
+### Finding 2: `reserve_tokens` cannot fill a partial block, and the natural way to call it is wrong
+
+The first working version allocated 25 blocks for 30 tokens. `reserve_tokens`
+rounds up and always appends, so asking it for the single new token of a decode
+step appends a whole new block and strands the fifteen slots already reserved in
+the tail. Counting tokens is the obvious way to call it and it is wrong; the
+capacity check has to count *blocks* and ask only for the ones the table is
+missing.
+
+This is documented, but only in a comment inside `tools/trace_replay`, which is
+where the same trap was hit before. It is a sharp edge in the C++ API rather
+than a bug in it: no test at the C++ level fails, because at that level nobody
+grows a sequence one token at a time. Every incremental-decode caller will hit
+it.
+
+### Finding 3: the tokens are identical and the logits do not drift at all
+
+| Check | Result |
+| --- | --- |
+| Tokens over 24 greedy steps | identical |
+| Final-logit max abs difference | 0.0 |
+| Blocks allocated for 61 tokens at 16/block | 4, as predicted |
+
+Exact zero is the right answer here rather than a suspicious one. The paged path
+stores the same fp32 bytes and gathers them back in the same order, so attention
+receives a bit-identical tensor and every downstream float op is unchanged. Any
+nonzero drift would mean bytes were being reordered or rounded somewhere, so the
+tolerance is 0 and not an epsilon.
+
+A gate that passes is only worth what it would catch, so it was checked against
+a deliberate break. Frames are forced to be non-contiguous by a spacer sequence
+that takes a frame between each of ours — the real table is `[63, 61, 59, 57]` —
+and with the gather patched to walk frames linearly instead of following the
+block table, the run diverges on the second token and fails. Without the spacer
+the frames come out adjacent and that mutation would have passed.
+
+### Finding 4: this path does not use the Triton kernel, and the gather says why it should
+
+`update()` has to return contiguous K/V for torch's attention to consume, so
+every step gathers the whole sequence out of its blocks into a dense tensor. The
+Triton kernel is not in this path at all. What this validates is the memory
+subsystem under a real model, which is worth having on its own, but it is not an
+end-to-end performance result and no timing here should be read as one.
+
+The gather's shape is the argument for finishing the job. It re-copies the
+entire context, per layer, per step, so a generation costs O(context × layers)
+per token and quadratic in tokens overall. Projecting from the 2B block shape
+(28 layers, 8 KV heads, head_dim 128, bf16) gives 112 KiB per token of context
+per step:
+
+| Context | Gathered per decode step | At PCIe ~10 GB/s | At device-to-device ~300 GB/s |
+| --- | --- | --- | --- |
+| 1,280 (one image prefill) | 140 MiB | ~15 ms | ~0.5 ms |
+
+Against a measured kernel decode of tens of microseconds at these shapes, even
+the device-to-device figure is an order of magnitude more expensive than the
+attention it feeds. Those are arithmetic projections from the block shape, not
+measurements. The measured figure here is 0.60 MiB across 50 `update` calls on
+the two-layer model, which is too small to time meaningfully and is reported only
+to show the quantity is being tracked.
+
+### Verification status
+
+| Check | Status |
+| --- | --- |
+| Tokens identical to `DynamicCache` over 24 greedy steps | pass |
+| Final-logit drift | pass, exactly 0.0 |
+| Block count matches the context length | pass, 4 blocks for 61 tokens |
+| Prefill spans multiple blocks, last block partially filled | pass, 37-token prefill over 3 blocks |
+| Frames physically scattered, so the gather must follow the block table | pass, `[63, 61, 59, 57]` |
+| Gate fails when the gather ignores the block table | pass, diverges at token 2 |
+| Week 17 checks still pass | pass, 153 tests and the live pool check |
+
+### Known limitations of these numbers
+
+- **Random weights, two layers.** This gates the paging, not any checkpoint. A
+  real model can still fail on things this cannot see: M-RoPE position handling,
+  the vision tower's contribution to the prefill, and bf16 rather than fp32.
+- **No image.** The prompt is text tokens. The vision path is configured but
+  never exercised, so nothing here covers the long image prefill that motivates
+  the block shape in the first place.
+- **Batch size 1, greedy, fp32, single sequence.** All four are asserted rather
+  than handled. In particular there is no fork here, so prompt sharing across
+  sampling branches — the thing paging exists to make cheap — is still unmeasured.
+- **The gather is the path, not the kernel.** Stated above and worth repeating:
+  no number in this section reflects the Triton kernel, because the Triton kernel
+  does not run in it.
