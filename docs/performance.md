@@ -1386,6 +1386,25 @@ Launch is still 90 µs/layer of two kernel launches. CUDA graphs would capture
 the second; they would not capture the first. The remaining 4 ms versus dense
 is those two, in that order.
 
+### Finding 5: a decode-only write cut 1.2 ms, and launch is now the larger leftover
+
+`update()` no longer permutes a span and walks block boundaries for a single
+token. It stores `[kv_heads, dim]` at `token % tokens_per_block` through two
+flat `copy_`s, using bases cached on the layer.
+
+| | After reuse | After decode write |
+| --- | ---: | ---: |
+| Write | 3.12 ms/step | 1.95 |
+| Table | 0.25 | 0.26 |
+| Launch | 2.56 | 2.64 |
+| Versus dense | +3.92 | +3.92 |
+
+The write bucket moved; the wall-versus-dense number did not, because dense
+moved with it on this run (30.98 → 30.38). Absolute kernel wall was 34.90 →
+34.30 ms/step. Launch is now the larger paged bucket, and it is the one a
+CUDA graph can capture. What is left of write is 70 µs/layer of two small
+device copies — a store kernel is the next lever there, not more Python.
+
 ### Verification status
 
 | Check | Status |

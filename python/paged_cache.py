@@ -267,6 +267,9 @@ class PagedLayer(CacheLayerMixin):
             f"model runs in {key_states.dtype} but the pool was sized for {self.pool.dtype}")
         assert key_states.shape[0] == 1, "PagedLayer handles batch size 1"
         self.dtype, self.device = key_states.dtype, key_states.device
+        self._key_base = self.pool.stream_base(self.layer_idx, qp.KVStream.Key)
+        self._val_base = self.pool.stream_base(self.layer_idx, qp.KVStream.Value)
+        self._token_elems = self.pool.num_kv_heads * self.pool.head_dim
         self.is_initialized = True
 
     def update(self, key_states, value_states, *args, **kwargs):
@@ -276,6 +279,16 @@ class PagedLayer(CacheLayerMixin):
         new_tokens = key_states.shape[-2]
         start, end = self.length, self.length + new_tokens
         self.pool.ensure_capacity(self.sequence_id, end)
+
+        if new_tokens == 1:
+            # One token, already [kv_heads, dim] in the model's layout. The
+            # prefill loop below permutes a whole span and walks block
+            # boundaries; that was 0.11 ms/layer to store 4 KiB.
+            self._write_one(key_states, value_states, start)
+            self.length = end
+            if self.pool.use_kernel:
+                return key_states, value_states
+            return self._gather()
 
         # [1, kv_heads, tokens, dim] -> [tokens, kv_heads, dim], matching the
         # in-block layout so each block is one assignment. This crosses to the
@@ -296,12 +309,21 @@ class PagedLayer(CacheLayerMixin):
             position += count
 
         self.length = end
-        # Decode is one token. Returning it instead of the gathered context is
-        # what lets the attention implementation below launch Triton; torch
-        # attention would be wrong if it consumed this. Prefill still gathers.
-        if self.pool.use_kernel and new_tokens == 1:
-            return key_states, value_states
         return self._gather()
+
+    def _write_one(self, key_states, value_states, position):
+        frame = self.pool.writable_frame(self.sequence_id, position)
+        offset = position % self.pool.tokens_per_block
+        tok = self._token_elems
+        key_at = self._key_base + offset * tok
+        val_at = self._val_base + offset * tok
+        key_row = key_states[0, :, 0, :].reshape(-1)
+        value_row = value_states[0, :, 0, :].reshape(-1)
+        if key_row.device != self.pool.frames.device:
+            key_row = key_row.to(self.pool.frames.device)
+            value_row = value_row.to(self.pool.frames.device)
+        self.pool.frames[frame, key_at:key_at + tok].copy_(key_row)
+        self.pool.frames[frame, val_at:val_at + tok].copy_(value_row)
 
     def attend_decode(self, query, scale):
         """Runs Triton over this layer's pages. `query` is [batch, heads, 1, dim]."""
