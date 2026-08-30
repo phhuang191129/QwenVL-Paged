@@ -1417,6 +1417,23 @@ The change was reverted. Partitioning stays the default. A CUDA graph would
 now have to capture the partitioned pair, not a single kernel, and it would
 be capturing useful device work rather than empty launch overhead.
 
+### Finding 7: of the launch bucket, 2.7 ms is GPU time and 0.5 ms is host dispatch
+
+CUDA events around the partitioned pair, same 20-step decode:
+
+| Split of launch | ms/step | ms/layer |
+| --- | ---: | ---: |
+| Device (both kernels) | 2.69 | 96 µs |
+| Host dispatch | 0.54 | 19 µs |
+| Launch wall | 3.23 | 115 µs |
+
+A CUDA graph can take the 0.54 ms and nothing of the 2.69 ms. That is the
+ceiling, and it is why graphs are not the next build: they are a large
+project (fixed Q and `context_len` buffers, recapture when the table moves)
+for a fifth of a millisecond per layer. The remaining paged cost that is
+still worth a cheap cut is the 2.0 ms write, or accepting +4–6 ms versus
+dense as the price of paging on this path.
+
 ### Verification status
 
 | Check | Status |

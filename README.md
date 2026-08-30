@@ -363,8 +363,9 @@ prompt the host path costs 51 ms/step over dense and the two device paths both
 cost ~11 ms/step — putting the kernel in the path did not move the number, so
 that 11 ms was write (~4 ms), rebuilding the block table every layer (~3 ms),
 and launch (~3 ms). Caching the table, the current token's frame, and the kernel scratch, then
-storing a decode token without the prefill loop, dropped write to 2.0 ms/step
-and left launch (2.6 ms) as the larger leftover. See
+storing a decode token without the prefill loop, left write at 2.0 ms/step.
+Launch is 3.2 ms, of which CUDA events attribute 2.7 ms to the GPU and 0.5 ms
+to host dispatch — not enough to justify a CUDA graph. See
 `docs/performance.md` week 21.
 
 ```bash

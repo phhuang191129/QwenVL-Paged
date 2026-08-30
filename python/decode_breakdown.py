@@ -2,10 +2,10 @@
 """Splits the 11 ms/step the kernel did not remove.
 
 Week 20 put Triton in the decode path and the overhead versus DynamicCache
-stayed at 11 ms/step. This times the three paged-only pieces of one decode
-step — writing the new token into a page, building the block table, launching
-Triton — against the same step through a dense cache, so the next optimization
-is chosen from a table rather than a guess.
+stayed at 11 ms/step. This times the paged-only pieces of one decode step — writing the new token,
+building the block table, launching Triton — and splits launch into GPU time
+(CUDA events) and host dispatch, so a CUDA graph is chosen from a table
+rather than a guess.
 
 Prefill is excluded. The loop is one token at a time after a filled cache, with
 a CUDA sync around each bucket so host timers see device work.
@@ -36,8 +36,10 @@ from qwen3vl_2b_check import DTYPE, MODEL_ID, NEW_TOKENS, build_inputs
 
 class Buckets:
     def __init__(self):
-        self.ns = {name: 0.0 for name in ("update", "gather", "table", "launch")}
+        self.ns = {name: 0.0 for name in ("update", "gather", "table", "launch", "device")}
         self.calls = 0
+        self.start_evt = torch.cuda.Event(enable_timing=True)
+        self.end_evt = torch.cuda.Event(enable_timing=True)
 
     def add(self, name, seconds):
         self.ns[name] += seconds
@@ -79,6 +81,7 @@ def instrument(buckets: Buckets):
         layout = self.pool.layout
         torch.cuda.synchronize()
         started = time.perf_counter()
+        buckets.start_evt.record()
         out = paged_attention_decode_partitioned(
             self.pool.frames,
             table,
@@ -94,8 +97,10 @@ def instrument(buckets: Buckets):
             scale=scale,
             scratch=self.pool._scratch,
         )
-        torch.cuda.synchronize()
+        buckets.end_evt.record()
+        buckets.end_evt.synchronize()
         buckets.add("launch", time.perf_counter() - started)
+        buckets.add("device", buckets.start_evt.elapsed_time(buckets.end_evt) / 1e3)
         return out.unsqueeze(1).contiguous()
 
     PagedLayer.update = update
@@ -148,6 +153,14 @@ def report(title, wall, buckets: Buckets | None, steps, layers, dense_wall=None)
         print(f"  {name:<8s} {seconds / steps * 1e3:7.2f}  "
               f"{seconds / steps / layers * 1e3:8.2f}  "
               f"{seconds / wall * 100:5.1f}%")
+    device = buckets.ns["device"]
+    dispatch = buckets.ns["launch"] - device
+    print(f"  {'device':<8s} {device / steps * 1e3:7.2f}  "
+          f"{device / steps / layers * 1e3:8.2f}  "
+          f"{device / wall * 100:5.1f}%   (CUDA events, split of launch)")
+    print(f"  {'dispatch':<8s} {dispatch / steps * 1e3:7.2f}  "
+          f"{dispatch / steps / layers * 1e3:8.2f}  "
+          f"{dispatch / wall * 100:5.1f}%   (launch minus device)")
     print(f"  calls   {buckets.calls} decode updates "
           f"(expected {steps * layers})")
 
