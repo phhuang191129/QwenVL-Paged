@@ -10,6 +10,12 @@ the reasoning behind what exists. This document is the plan for what comes next:
 weeks 9–16, with the early phases specified in detail and the later ones sketched
 to the level where their first task is unambiguous.
 
+**Status after the L4 session.** Weeks 9, 13, and 15–16 are done, plus the
+device-pool / kernel / memory work recorded as weeks 17–23 in
+[`performance.md`](performance.md). The GPU box is closed. **Next is week 14**
+(serving policy, CPU, week-9 traces). Weeks 11–12 (fast CPU kernel) are still
+open and do not need a GPU. Do not treat weeks 15–16 as upcoming.
+
 **Contents**
 
 1. [Where the project actually stands](#1-where-the-project-actually-stands)

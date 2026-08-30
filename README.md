@@ -375,11 +375,22 @@ PYTHONPATH=build .venv/bin/python python/decode_breakdown.py
 `python/fork_sharing_check.py` covers the property paging exists for, now on the
 device pool so copy-on-write goes through the hook rather than a host memcpy.
 Four continuations share all 78 prompt blocks and privately own two each, so
-they hold 150 MiB where four dense caches hold 552 MiB.
+they hold 150 MiB where four dense caches hold 552 MiB. Eight branches of the
+same prompt hold 164 MiB of KV (339 MiB above the weights) where eight dense
+caches hold 1103 MiB — 6.71x on KV bytes, 3.29x on the GPU allocator, which
+counts the reserved slab. See `docs/performance.md` week 22.
 
 ```bash
 PYTHONPATH=build .venv/bin/python python/fork_sharing_check.py
+PYTHONPATH=build .venv/bin/python python/concurrency_mem.py
+PYTHONPATH=build .venv/bin/python python/fork_kernel_diag.py
 ```
+
+Week 20 left one Triton continuation ungated. That flip is a 0.125-logit
+tie on seed `The` (no fork required); the other three top-4 seeds match.
+See `docs/performance.md` week 23. The GPU session that produced weeks
+15–23 is closed: remaining work is CPU-side, and a prefill kernel, fused
+HF batch, or CUDA graphs would be a new rental, not a leftover step.
 
 ## Usage
 
@@ -482,9 +493,10 @@ benchmarked at the real block shape
 Qwen3-VL-2B-Instruct now runs on the paged cache and is token-identical to
 transformers' `DynamicCache`, image prompt included, on a host pool, a device
 gather, and a Triton decode in the forward pass. Four sampling branches of one
-prompt hold 3.67x less KV than four dense caches. Decode through the kernel is
-still ~11 ms/step over dense — the same as the device gather — because the
-remaining cost is Python dispatch, not attention. Four of the six
+prompt hold 3.67x less KV than four dense caches; eight hold 6.71x less KV
+and 3.29x less GPU memory. Decode through the kernel is ~5 ms/step over
+dense on the decode-only path. A CUDA graph could take 0.5 ms of host
+dispatch and nothing of the 2.7 ms of device time inside that gap. Four of the six
 synchronization rules in
 [`docs/architecture.md`](docs/architecture.md) are exercised by
 `tests/SynchronizationRules.test.cpp`; the remaining two govern an asynchronous

@@ -23,6 +23,9 @@ Frames are not scattered here. The other two gates cover that, and a spacer
 sequence would sit in the middle of the frame accounting this script exists to
 report. The pool is device-resident, so each first write goes through the copy
 hook rather than a host memcpy -- the path a serving loop would actually take.
+Token identity is gated on gather; Triton on these same seeds is
+`fork_kernel_diag.py` (week 23): one continuation is a 0.125-logit tie,
+not a wrong frame.
 
 Usage:
     PYTHONPATH=build .venv/bin/python python/fork_sharing_check.py

@@ -1277,9 +1277,9 @@ The same four-branch prompt that is token-identical through a device gather
 diverged on one continuation at decode step 18 when that continuation ran
 through Triton. The flip is stable across reruns. The single-sequence 2B
 generate does not show it. Fork sharing therefore stays on the gather path,
-where it already gates copy-on-write against `DynamicCache`. Whether this is
-online-softmax drift under a remapped tail block or a real read of the wrong
-frame is not resolved here.
+where it already gates copy-on-write against `DynamicCache`. Week 23
+resolves this: the same seed flips with no fork, and gather/SDPA reports
+tokens 504 and 5916 tied at 26.625.
 
 ### Verification status
 
@@ -1450,4 +1450,185 @@ dense as the price of paging on this path.
   the next layer's `update()`.
 - **One prompt, 20 tokens, batch 1.** Same shape as week 20 on purpose.
 - **No change to the kernel or the write path.** This file is a measurement.
+
+---
+
+## Week 22: Device Memory Of N Shared Prefixes
+
+Batch-1 decode cannot show the throughput paging is supposed to raise. What
+this GPU can still show is the number paging exists to change: how much device
+memory N live prefixes occupy when they share a prompt versus when each
+carries its own copy. That is the last measurement that needed this box.
+CUDA graphs were not started; week 21 already put their ceiling at 0.54 ms
+of host dispatch.
+
+```bash
+PYTHONPATH=build .venv/bin/python python/concurrency_mem.py
+```
+
+Same 1,242-token image prompt, same 20 greedy tokens, eight branches seeded
+from the top-8 next tokens. Eight independent `DynamicCache`s are filled and
+decoded first, then dropped; then one device pool is forked eight ways and
+decoded the same way. `torch.cuda.memory_allocated()` above the loaded model
+is the GPU number. KV bytes held is reported next to it so a driver that
+caches activations differently still has a like-for-like counter.
+
+### Finding 1: eight shared prefixes hold 6.7x less KV, and 3.3x less GPU memory
+
+| | Dense (8 caches) | Paged (1 pool, 8 forks) |
+| --- | ---: | ---: |
+| Above the 3.99 GiB model | 1113 MiB | 339 MiB |
+| KV bytes held | 1103 MiB | 164 MiB |
+| Frames | equivalent of 632 | 94 (77 shared, 17 owned) |
+
+KV 6.71x, GPU allocator 3.29x. The four-way gate in week 18 was 3.67x on KV
+bytes; doubling the branches nearly doubled the ratio, which is what the
+design predicts. The shared part is the prompt (77 blocks, 135 MiB) and the
+private part is two blocks per branch plus the leftover parent tail.
+
+### Finding 2: the GPU allocator ratio is smaller because the pool is reserved up front
+
+The KV counter counts frames in use. `memory_allocated` counts the whole
+slab, including unused frames reserved for growth, plus whatever CUDA kept
+for the forwards. That is why 164 MiB of live KV sits inside 339 MiB above
+the model, and why 3.29x is the honest serving number: a serving loop pays
+for the pool it reserved, not for the frames it has touched so far.
+
+The dense side is almost all KV (1113 vs 1103). There is no reserved slack
+on that path; each cache is exactly as large as the sequence it holds.
+
+### Finding 3: this is a memory result, not a throughput result
+
+The eight branches still step one at a time. Nothing here batches them, so
+nothing here can claim tokens per second. The claim is only that eight live
+continuations of one image prompt fit in 339 MiB above the weights where
+eight dense caches take 1113 MiB, and that the gap is the shared prompt.
+
+### Verification status
+
+Re-ran every GPU gate on this box after the measurement, including the
+decode-only write's missing fields on a forked `PagedLayer` (the child
+copied `is_initialized` but not the cached stream bases, and the first
+decode store faulted).
+
+| Check | Status |
+| --- | --- |
+| 8 paged prefixes use less device memory than 8 dense caches | pass, 339 vs 1113 MiB |
+| KV bytes 6.71x, frames 94 as accounted | pass |
+| Four-way fork still token-identical, 86 frames | pass |
+| 2B host / gather / kernel token-identical over 20 steps | pass |
+| Tiny-model gather and kernel gates | pass |
+| Live allocator-managed pool vs CPU reference | pass, 5.4e-07 |
+| Golden fixtures, including partitioned splits | pass |
+| Decode-only breakdown still +5 ms vs dense, dispatch 0.52 ms | pass |
+
+### Known limitations of these numbers
+
+- **Batch size 1.** Eight prefixes share a pool and are decoded sequentially.
+  There is still no fused-batch throughput number.
+- **The pool is over-reserved.** Slack frames are in the GPU number on
+  purpose. A tighter `max_blocks` would move 3.29x toward 6.71x and would
+  also be closer to an OOM.
+- **`memory_allocated` at rest, not peak during a forward.** The comparison
+  is resident caches after the last decode step.
+- **Twenty tokens, one prompt, one image.** Same shape as week 18 on
+  purpose, so the n=4 and n=8 ratios sit on the same sequence.
+
+---
+
+## Week 23: The Fork+Kernel Flip Was A Logit Tie
+
+Week 20 finding 3 left four-way fork through Triton ungated after one
+continuation flipped at decode step 18. That was the last GPU correctness
+question. It is not a fork bug.
+
+```bash
+PYTHONPATH=build .venv/bin/python python/fork_kernel_diag.py
+```
+
+### Finding 1: the same flip happens with no fork
+
+Seed 785 (`The`), decoded on a single sequence with no `fork_paged_cache`,
+disagrees with `DynamicCache` at step 18. Isolating that branch, and
+running it after the other three have already copy-on-written, produce
+the same tokens. Copy-on-write and table remapping are not in the causal
+path.
+
+Seeds 32, 1986, and 2082 (`A` / `This` / `An`) match through Triton on
+the same hand-rolled decode loop. The greedy 2B generate gate never
+leaves the `A...` continuation, which is why it stayed token-identical.
+
+### Finding 2: gather/SDPA ties, the kernel breaks the tie by 0.125
+
+At the flip, both paths rank the same two tokens first:
+
+| Path | Token 5916 | Token 504 |
+| --- | ---: | ---: |
+| Gather / SDPA | 26.625 | 26.625 |
+| Triton | 26.625 | 26.5 |
+
+SDPA reports an exact tie; `argmax` takes the lower id (504). The kernel
+is 0.125 lower on 504 — one bf16 step at this magnitude — and so emits
+5916. That is online softmax versus SDPA, not a read of the wrong frame.
+The CPU reference already agrees with Triton to ~1e-7 on fixtures; the
+token-identity bar against torch SDPA is stricter than that arithmetic.
+
+`bind_paged_layers` is still required after a fork (decode writes the
+child, Triton reads whichever layer object is bound). That is an API
+fact, not this flip.
+
+### Verification status
+
+| Check | Status |
+| --- | --- |
+| Seeds 0, 1, 3 token-identical through Triton | pass |
+| Seed 2 flips only at step 18 on `{504, 5916}` | pass, gap 0.125 |
+| Same flip with no fork | pass |
+| Four-way fork on gather still token-identical | pass, `fork_sharing_check.py` |
+
+### Known limitations of these numbers
+
+- **One prompt, four seeds, 20 tokens.** A different near-tie would look
+  the same and is accepted; a flip with a logit gap above 0.25 is a
+  regression and fails the script.
+- **No change to the kernel.** The gather path remains the fork
+  token-identity gate.
+
+---
+
+## GPU Session Closed
+
+This rented L4 session is done. Everything below can be done without a
+GPU. Anything that would need another box is a new project, not a
+leftover step of this one.
+
+**Closed on this box**
+
+- Triton decode kernel vs CPU fixtures, live allocator pool, and the 2B
+- Device-resident pool and copy-on-write through `set_copy_hook`
+- Kernel in the Hugging Face forward pass (decode only)
+- Decode breakdown: write 2.0 ms, launch 3.2 ms of which 0.5 ms is host
+  dispatch
+- CUDA graphs: not started; ceiling is the 0.5 ms
+- `num_partitions=1`: measured slower, reverted
+- N-way prefix memory: 8 forks are 6.71× KV / 3.29× GPU vs 8 dense caches
+- Fork+kernel flip: logit tie, recorded rather than "fixed"
+
+**Does not need a GPU**
+
+- Week 14 serving policy (trace replay, scheduler)
+- CPU kernel work (weeks 11–12)
+- Docs, the vLLM comparison, upstream
+- Host swap / CPU reference kernel (already host-only by contract)
+
+**Would be a new GPU session, not a leftover**
+
+- A Triton prefill kernel (prefill is a one-shot gather and is
+  token-identical)
+- Fused batch in the Hugging Face generate path (the kernel already
+  measures batch 32; the model path is batch-1 by contract)
+- Quantized KV (roadmap cut-order item)
+- Device-aware swap
+- A store kernel for the remaining 2 ms write
+- CUDA graphs for 0.5 ms of dispatch
 

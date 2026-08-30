@@ -419,12 +419,22 @@ def paged_attention_forward(module, query, key, value, attention_mask, scaling,
                  dropout=dropout, **kwargs)
 
 
-def install_paged_attention(model, cache):
-    """Points each text attention module at its `PagedLayer` and selects it."""
-    ALL_ATTENTION_FUNCTIONS.register("qwenvl_paged", paged_attention_forward)
+def bind_paged_layers(model, cache):
+    """Points each text attention module at this cache's `PagedLayer`.
+
+    Must be called again after `fork_paged_cache`. The attention implementation
+    is process-wide; the layer object is per sequence. Leaving the parent bound
+    makes decode write the child and Triton read the parent.
+    """
     for decoder_layer, paged_layer in zip(model.model.language_model.layers, cache.layers):
         decoder_layer.self_attn._paged_layer = paged_layer
         decoder_layer.self_attn.config._attn_implementation = "qwenvl_paged"
+
+
+def install_paged_attention(model, cache):
+    """Registers the decode kernel and binds this cache's layers."""
+    ALL_ATTENTION_FUNCTIONS.register("qwenvl_paged", paged_attention_forward)
+    bind_paged_layers(model, cache)
 
 
 def build_paged_cache(text_config, max_blocks, tokens_per_block=DEFAULT_TOKENS_PER_BLOCK,
@@ -465,5 +475,9 @@ def fork_paged_cache(parent, pool, child_id):
         layer.length = source.length
         layer.is_initialized = source.is_initialized
         layer.dtype, layer.device = source.dtype, source.device
+        if source.is_initialized:
+            layer._token_elems = source._token_elems
+            layer._key_base = source._key_base
+            layer._val_base = source._val_base
         layers.append(layer)
     return Cache(layers=layers)
