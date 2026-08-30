@@ -1151,14 +1151,154 @@ instead of 86.
   like-for-like counter; it is also the one that stays meaningful once the pool
   moves to the device.
 - **The gather is the path, not the kernel.** No number in this section reflects
-  the Triton kernel, because the Triton kernel does not run in it. The 35 ms per
-  step is the cost of *not* having it in the path.
-- **The pool is still host memory.** Every gather crosses PCIe. A device-resident
-  pool would cut that cost substantially without removing it, and is still
-  blocked on the three host dereferences from week 17 finding 5.
+  the Triton kernel, because the Triton kernel does not run in it. The host-pool
+  53 ms/step is the cost of *not* having it in the path; week 19 moves the pool
+  to the device and measures what remains.
 - **Twenty tokens, one prompt, one image.** Enough to catch a systematic paging
   error, which is what it is for. It is not a sweep, and nothing here varies
   context length, image size, or generation length.
 - **No throughput or latency claim.** The wall-clock figures compare two
   correctness harnesses on one sequence. They bound the gather cost; they are not
   a serving measurement.
+
+## Week 19: A Device-Resident Pool
+
+Week 17 said a device pool was blocked on three host dereferences. Only one of
+those three is on the serving path: `copy_block`, which copy-on-write uses. The
+swap backend and the CPU reference kernel stay host-only; this path does not
+call them. `set_copy_hook` replaces the memcpy with a caller-supplied
+device-to-device copy, and the allocator adopts a CUDA tensor by address because
+a device tensor has no buffer protocol.
+
+```bash
+PYTHONPATH=build .venv/bin/python python/qwen3vl_2b_check.py
+PYTHONPATH=build .venv/bin/python python/fork_sharing_check.py
+```
+
+### Finding 1: the device pool is token-identical, and copy-on-write still works
+
+Same 1,242-token image prompt, same 20 greedy steps, same four-way fork. Both
+the host pool and the device pool match `DynamicCache` token for token. The
+fork still shares 78 prompt blocks and privately owns two per branch; the
+parent's table is unchanged. The only difference is that each first write now
+goes through `frames[dst].copy_(frames[src])` instead of `std::memcpy`.
+
+### Finding 2: moving the pool off PCIe recovered most of the 53 ms, and left 12 ms that is not bandwidth
+
+| Path | 20-step wall clock | Overhead vs dense |
+| --- | ---: | ---: |
+| `DynamicCache` | 0.82 s | — |
+| Host pool | 1.88 s | +53.3 ms/step |
+| Device pool | 1.05 s | +11.6 ms/step |
+
+The host number is the PCIe gather from week 18, now timed against a warmed
+dense run rather than absorbing CUDA setup. The device number is the same
+gather on the same side of the bus. 137 MiB at the L4's ~300 GB/s peak is
+0.5 ms, so about 11 ms of the remaining 12 is not the copy. It is the Python
+write loop, the per-step block-table rebuild, and torch attention over a freshly
+assembled tensor — the work a native paged kernel skips by reading the frames
+in place.
+
+That is the argument for the next step, and it is now a measurement rather than
+a projection: the device pool made the kernel reachable, and it did not make
+the gather cheap enough to leave in the path.
+
+### Verification status
+
+| Check | Status |
+| --- | --- |
+| `copy_block` hook replaces the default memcpy | pass |
+| Copy-on-write routes through the hook | pass |
+| Host pool still token-identical on the 2B | pass |
+| Device pool token-identical on the 2B | pass |
+| Device pool faster than host pool | pass, 1.05 s vs 1.88 s |
+| Four-way fork on the device pool, 86 frames as predicted | pass |
+| Week 18 tiny-model gate and week 17 live-pool check | pass, 155 tests |
+
+### Known limitations of these numbers
+
+- **Swap and the CPU oracle still dereference host pointers.** Adopting a device
+  slab and then calling `swap_out` or `KVCacheManager.decode` will fault. Those
+  paths are unused here and are not claimed to work.
+- **The by-address constructor cannot keep the tensor alive.** A CUDA tensor
+  exposes no buffer protocol, so Python has to hold `PagedPool.storage`. That is
+  documented on the binding and is the one place the header's lifetime contract
+  is not mechanically enforced.
+- **The 12 ms is not attributed to a single site.** The table above isolates
+  PCIe from everything else; it does not split the remainder into write-loop vs
+  gather vs torch attention. The kernel removes all three at once, which is why
+  that split was not measured before writing it.
+- **Still no kernel in the forward pass.** Torch attention still consumes a
+  gathered tensor. Week 19 made that gather local; it did not remove it.
+
+## Week 20: The Triton Kernel In The Forward Pass
+
+The kernel is decode-only, so prefill still gathers and uses torch SDPA. Decode
+writes the new token into its page, skips the gather, and a registered
+`qwenvl_paged` attention implementation launches the partitioned kernel against
+the slab and the block table. Vision layers never get a `_paged_layer` and fall
+through, so the ViT is untouched.
+
+```bash
+PYTHONPATH=build .venv/bin/python python/token_identical_check.py
+PYTHONPATH=build .venv/bin/python python/qwen3vl_2b_check.py
+```
+
+### Finding 1: decode through Triton is token-identical on the tiny model and on the 2B
+
+The tiny random-weight config matches `DynamicCache` for 24 greedy steps. The
+real 2B matches for 20 steps on a 1,242-token image prompt, including a
+physically scattered block table. Prefill is still torch attention over a
+gather; only the 20 decode steps go through Triton.
+
+### Finding 2: putting the kernel in the path did not beat the gather, so the 11 ms is not the gather
+
+| Path | 20-step wall clock | Overhead vs dense |
+| --- | ---: | ---: |
+| `DynamicCache` | 0.82 s | — |
+| Host pool | 1.85 s | +51.3 ms/step |
+| Device gather | 1.04 s | +11.1 ms/step |
+| Device kernel | 1.05 s | +11.4 ms/step |
+
+Week 19 left ~11 ms after PCIe was removed and guessed it was "write loop,
+block-table rebuild, and torch attention over a gathered tensor," expecting the
+kernel to remove all three. It removed the third. The number did not move. The
+remaining 11 ms is therefore the shared Python path — `update()` writing the
+new token, pybind into the allocator, building a block-table tensor, and
+dispatching attention — not the bytes Triton vs torch attention move.
+
+The kernel's own decode at this shape is tens of microseconds. 11 ms/step
+across 28 layers is ~400 µs of host work per layer, which is also why CUDA
+graphs and a tighter write path are the next levers, not another kernel tweak.
+
+### Finding 3: four-way fork through the kernel flipped one token at step 18
+
+The same four-branch prompt that is token-identical through a device gather
+diverged on one continuation at decode step 18 when that continuation ran
+through Triton. The flip is stable across reruns. The single-sequence 2B
+generate does not show it. Fork sharing therefore stays on the gather path,
+where it already gates copy-on-write against `DynamicCache`. Whether this is
+online-softmax drift under a remapped tail block or a real read of the wrong
+frame is not resolved here.
+
+### Verification status
+
+| Check | Status |
+| --- | --- |
+| Tiny model, Triton decode token-identical | pass, 24 steps |
+| 2B generate, host / device gather / device kernel token-identical | pass, 20 steps |
+| Device pool still faster than host pool | pass |
+| Four-way fork on the device gather path | pass, 86 frames |
+| Four-way fork through the kernel vs `DynamicCache` | not a gate; one token flip |
+
+### Known limitations of these numbers
+
+- **Prefill is still a gather.** There is no Triton prefill kernel. The 1,242-token
+  image prompt is attended with SDPA over assembled K/V, once.
+- **The 11 ms was not the gather.** Stated above. A serving loop that still
+  calls `update()` from Python per layer per token will not see the kernel's
+  tens of microseconds.
+- **Fork through the kernel is not gated.** Finding 3.
+- **No CUDA graph, no batched decode.** One sequence, one token, 28 separate
+  launches per step.
+

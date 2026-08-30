@@ -9,6 +9,7 @@
  * intentional for this phase of the project.
  */
 
+#include "qwenvl_paged/KVCacheManager.h"
 #include "qwenvl_paged/MemoryAllocator.h"
 #include "qwenvl_paged/SwapBackend.h"
 
@@ -18,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace qwenvl_paged {
@@ -243,6 +245,55 @@ TEST(MemoryAllocatorTest, RetainRequiresMatchingReleaseCountBeforeFree) {
 //         EXPECT_EQ(destination_block->data()[i], source_block->data()[i]);
 //     }
 // }
+
+// The seam a pool the CPU cannot address depends on. copy_block is the only
+// site copy-on-write needs to move bytes through, so redirecting it is what
+// lets an owner of device storage keep forking.
+TEST(MemoryAllocatorTest, CopyHookReplacesTheDefaultMemcpy) {
+    MemoryAllocator allocator(make_test_config(2));
+
+    const std::optional<PhysicalBlockId> source = allocator.allocate();
+    const std::optional<PhysicalBlockId> destination = allocator.allocate();
+    ASSERT_TRUE(source.has_value());
+    ASSERT_TRUE(destination.has_value());
+
+    PhysicalBlock* source_block = allocator.block(*source);
+    PhysicalBlock* destination_block = allocator.block(*destination);
+    ASSERT_NE(source_block, nullptr);
+    ASSERT_NE(destination_block, nullptr);
+    source_block->data()[0] = std::byte{0xAB};
+    destination_block->data()[0] = std::byte{0x00};
+
+    std::optional<std::pair<PhysicalBlockId, PhysicalBlockId>> observed;
+    allocator.set_copy_hook([&observed](PhysicalBlockId from, PhysicalBlockId to) {
+        observed = std::make_pair(from, to);
+    });
+
+    allocator.copy_block(*source, *destination);
+
+    ASSERT_TRUE(observed.has_value());
+    EXPECT_EQ(observed->first, *source);
+    EXPECT_EQ(observed->second, *destination);
+    EXPECT_EQ(destination_block->data()[0], std::byte{0x00})
+        << "the default memcpy still ran, so the hook did not replace it";
+}
+
+TEST(MemoryAllocatorTest, CopyOnWriteRoutesThroughTheCopyHook) {
+    MemoryAllocator allocator(make_test_config(4));
+    KVCacheManager cache(allocator);
+
+    constexpr SequenceId kParent = 1;
+    constexpr SequenceId kChild = 2;
+    ASSERT_TRUE(cache.create_sequence(SequenceMetadata{kParent, kParent, {}, {}}));
+    ASSERT_TRUE(cache.reserve_tokens(kParent, 1));
+    ASSERT_TRUE(cache.fork_sequence(kParent, SequenceMetadata{kChild, kChild, {}, {}}));
+
+    std::uint32_t calls = 0;
+    allocator.set_copy_hook([&calls](PhysicalBlockId, PhysicalBlockId) { ++calls; });
+
+    EXPECT_TRUE(cache.ensure_token_writable(kChild, 0).has_value());
+    EXPECT_EQ(calls, 1u) << "materializing a shared block did not go through the hook";
+}
 
 TEST(MemoryAllocatorTest, BlockAndInfoReturnNullptrForInvalidId) {
     MemoryAllocator allocator(make_test_config(1));

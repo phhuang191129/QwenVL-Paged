@@ -27,7 +27,7 @@ from transformers.cache_utils import Cache, DynamicLayer
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from paged_cache import build_paged_cache
+from paged_cache import build_paged_cache, install_paged_attention
 
 # 37 makes prefill itself straddle three blocks, so the write loop has to split
 # one call across block boundaries rather than always landing inside one frame.
@@ -120,7 +120,29 @@ def main() -> int:
 
     ok = tokens_match and blocks_match and scattered and drift <= TOLERANCE
     print(f"\n{'pass' if ok else 'FAIL'}  paged KV cache vs DynamicCache on Qwen3-VL")
-    return 0 if ok else 1
+    if not ok or not torch.cuda.is_available():
+        return 0 if ok else 1
+
+    # Same tokens, now through Triton. Drift is expected: the kernel's online
+    # softmax is not torch SDPA. Tokens still have to match, or the kernel is
+    # reading the wrong bytes.
+    model = model.cuda()
+    prompt = prompt.cuda()
+    reference = Cache(layers=[DynamicLayer() for _ in range(text.num_hidden_layers)])
+    expected, _ = greedy(model, prompt, reference)
+
+    paged, pool = build_paged_cache(
+        text, max_blocks=MAX_BLOCKS, scatter=True, device="cuda", use_kernel=True)
+    install_paged_attention(model, paged)
+    actual, _ = greedy(model, prompt, paged)
+    kernel_match = actual == expected
+    print(f"  {'pass' if kernel_match else 'FAIL'}  Triton decode token-identical over "
+          f"{NEW_TOKENS} steps")
+    if not kernel_match:
+        print(f"    reference {expected}")
+        print(f"    kernel    {actual}")
+    print(f"\n{'pass' if kernel_match else 'FAIL'}  Triton kernel vs DynamicCache on Qwen3-VL")
+    return 0 if kernel_match else 1
 
 
 if __name__ == "__main__":

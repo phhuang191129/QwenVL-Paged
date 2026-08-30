@@ -128,7 +128,16 @@ void MemoryAllocator::retain(PhysicalBlockId id) {
     info.state = BlockState::Shared;
 }
 
+void MemoryAllocator::set_copy_hook(BlockCopyHook hook) {
+    copy_hook_ = std::move(hook);
+}
+
 void MemoryAllocator::copy_block(PhysicalBlockId source, PhysicalBlockId destination) {
+    if (copy_hook_) {
+        copy_hook_(source, destination);
+        return;
+    }
+
     PhysicalBlock* src = block(source);
     PhysicalBlock* dst = block(destination);
     if (src == nullptr || dst == nullptr) {

@@ -11,8 +11,10 @@
  * Ownership runs one way only: Python allocates the slab and keeps it alive,
  * and MemoryAllocator adopts the pointer. That keeps CUDA out of the C++ core
  * and lets the pool be a torch tensor the kernel can take directly. The
- * `keep_alive` on the constructor makes the contract the header describes
- * unbreakable from Python rather than merely documented.
+ * `keep_alive` on the buffer constructor makes the contract the header
+ * describes unbreakable from Python rather than merely documented. The
+ * by-address constructor cannot do that, for the reason given at its
+ * definition, and is the one place here where Python can still get it wrong.
  *
  * Scheduler is deliberately not exposed. Nothing in the seam needs it, and it
  * belongs with the serving-policy work rather than here.
@@ -25,6 +27,7 @@
 #include "qwenvl_paged/PagedAttention.h"
 #include "qwenvl_paged/SwapBackend.h"
 
+#include <pybind11/functional.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -198,6 +201,38 @@ PYBIND11_MODULE(qwenvl_paged, module) {
             // header's contract into something Python cannot get wrong.
             py::keep_alive<1, 3>(),
             "Adopts a caller-owned slab; size it with pool_bytes_for(config).")
+        .def(
+            // The device path. A CUDA tensor exposes no buffer protocol, so the
+            // only thing crossing is its address, and with it goes the
+            // keep_alive the overload above relies on: nothing here can tie the
+            // allocator's lifetime to storage it cannot see. The caller has to
+            // hold the tensor. `nbytes` is required so that at least the size
+            // mistake is still caught here rather than as a later stray write.
+            py::init([](const AllocatorConfig& config, std::uintptr_t address, std::size_t nbytes) {
+                const std::size_t required = pool_bytes_for(config);
+                if (nbytes < required) {
+                    throw std::invalid_argument(
+                        "pool storage holds " + std::to_string(nbytes) +
+                        " bytes but this config needs " + std::to_string(required) +
+                        "; size it with pool_bytes_for(config)");
+                }
+                if (address == 0) {
+                    throw std::invalid_argument("pool storage address is null");
+                }
+                return std::make_unique<MemoryAllocator>(
+                    config, reinterpret_cast<std::byte*>(address));
+            }),
+            py::arg("config"),
+            py::arg("address"),
+            py::arg("nbytes"),
+            "Adopts a slab by address, for storage the CPU cannot read. The caller "
+            "must keep it alive and must set a copy hook before forking.")
+        .def(
+            "set_copy_hook",
+            &MemoryAllocator::set_copy_hook,
+            py::arg("hook"),
+            "Replaces the host memcpy behind copy-on-write with hook(source_id, "
+            "destination_id). Required for a pool the CPU cannot address.")
         .def("allocate", &MemoryAllocator::allocate)
         .def("release", &MemoryAllocator::release)
         .def("retain", &MemoryAllocator::retain)

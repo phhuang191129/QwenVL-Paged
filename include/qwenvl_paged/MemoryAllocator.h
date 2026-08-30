@@ -72,6 +72,14 @@ struct PhysicalBlockInfo {
 class MemoryAllocator;
 
 /**
+ * @brief Moves one block's bytes to another, in place of the default memcpy.
+ *
+ * Both blocks belong to the pool, so an implementation only needs to know how
+ * to address its own frames. See `MemoryAllocator::set_copy_hook`.
+ */
+using BlockCopyHook = std::function<void(PhysicalBlockId source, PhysicalBlockId destination)>;
+
+/**
  * @brief Policy hook naming a block worth evicting under cache pressure.
  *
  * The selector only chooses; it must not mutate allocator state. Executing the
@@ -108,12 +116,12 @@ public:
      * allocator does the bookkeeping, and neither has to know about the other's
      * allocator.
      *
-     * Note what an adopted slab must still be, though. `copy_block`, the swap
-     * backend, and the CPU reference kernel reached through `CacheView` all
-     * dereference frame bytes on the host, so storage that is not
-     * host-addressable silently disables copy-on-write, swapping, and
-     * `paged_attention_decode`. Adopting device memory means making those three
-     * sites device-aware first; adopting pinned host memory works today.
+     * Note what an adopted slab must still be, though. Three sites dereference
+     * frame bytes on the host: `copy_block`, the swap backend, and the CPU
+     * reference kernel reached through `CacheView`. Storage the CPU cannot
+     * address therefore disables copy-on-write, swapping, and
+     * `paged_attention_decode`. `set_copy_hook` lifts the first of those, which
+     * is the one copy-on-write needs; the other two remain host-only.
      */
     MemoryAllocator(AllocatorConfig config, std::byte* adopted_pool);
 
@@ -146,6 +154,17 @@ public:
      * @brief Copies the bytes from one physical block to another.
      */
     void copy_block(PhysicalBlockId source, PhysicalBlockId destination);
+
+    /**
+     * @brief Replaces the host memcpy `copy_block` performs by default.
+     *
+     * The one site that has to move bytes for copy-on-write, and therefore the
+     * one that decides whether a pool can live somewhere the CPU cannot reach.
+     * The hook takes block ids rather than pointers so an owner of device
+     * storage can address its own frames however it likes without being handed
+     * a pointer it must not dereference.
+     */
+    void set_copy_hook(BlockCopyHook hook);
 
     /**
      * @brief Returns a mutable physical block by id, or nullptr if invalid.
@@ -280,6 +299,7 @@ private:
     std::vector<PhysicalBlockId> free_list_;
     SwapBackend* swap_backend_{nullptr};
     EvictionCandidateSelector eviction_selector_{};
+    BlockCopyHook copy_hook_{};
 };
 
 } // namespace qwenvl_paged

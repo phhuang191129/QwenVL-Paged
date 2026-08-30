@@ -329,10 +329,12 @@ cmake --build build -j
 PYTHONPATH=build .venv/bin/python python/live_pool_check.py
 ```
 
-The pool is still host memory mirrored per run rather than device-resident.
-`copy_block`, the swap backend, and `CacheView::block_bytes` all dereference
-frame bytes on the host, so adopting device memory needs those three sites to
-take a copy hook first — the bookkeeping itself already touches no bytes.
+The pool can now be device-resident. `set_copy_hook` replaces the host memcpy
+behind copy-on-write, and the allocator adopts a CUDA tensor by address. Swap
+and the CPU reference kernel still dereference host pointers and are unused on
+that path. The Triton kernel is still not in the model forward pass: torch
+attention gathers the context out of the blocks, now on-device rather than
+across PCIe. See `docs/performance.md` week 19.
 
 ## Paged Cache For Transformers
 
@@ -354,22 +356,22 @@ PYTHONPATH=build .venv/bin/python python/token_identical_check.py
 PYTHONPATH=build .venv/bin/python python/qwen3vl_2b_check.py
 ```
 
-`python/fork_sharing_check.py` covers the property paging exists for. Four
-continuations are sampled from one image prompt, each seeded with a different
-top-4 token so they genuinely diverge, and each must match what its seed produces
-against a private `DynamicCache`. The four share all 78 prompt blocks and
-privately own two each — the tail block copy-on-write duplicates, plus one block
-of growth — so they hold 150 MiB where four dense caches hold 552 MiB.
+The 2B gate runs a host pool, a device gather, and a device kernel. All three
+are token-identical to `DynamicCache` over 20 greedy steps. Prefill still
+gathers; decode writes the new token into its page and launches Triton. At this
+prompt the host path costs 51 ms/step over dense and the two device paths both
+cost ~11 ms/step — putting the kernel in the path did not move the number, so
+that 11 ms is the Python write and dispatch, not the gather. See
+`docs/performance.md` week 20.
+
+`python/fork_sharing_check.py` covers the property paging exists for, now on the
+device pool so copy-on-write goes through the hook rather than a host memcpy.
+Four continuations share all 78 prompt blocks and privately own two each, so
+they hold 150 MiB where four dense caches hold 552 MiB.
 
 ```bash
 PYTHONPATH=build .venv/bin/python python/fork_sharing_check.py
 ```
-
-This validates the memory subsystem against a real model; it does not run the
-Triton kernel. `update()` must return contiguous K/V for torch attention, so
-every step gathers the context out of its blocks — 137 MiB per step at that
-prompt length, about 35 ms, which is the cost a native paged kernel exists to
-remove. See `docs/performance.md` week 18.
 
 ## Usage
 
@@ -470,13 +472,11 @@ benchmarked at the real block shape
 ([`docs/performance.md`](docs/performance.md)).
 
 Qwen3-VL-2B-Instruct now runs on the paged cache and is token-identical to
-transformers' `DynamicCache`, image prompt included, and four sampling branches
-of one prompt hold 3.67x less KV than four dense caches. That path uses torch
-attention over gathered blocks rather than the Triton kernel, so there are still
-no end-to-end latency or throughput numbers. The kernel does
-read a pool the allocator manages through the pybind11 module under `python/`,
-though that pool is host memory mirrored to the device rather than
-device-resident. Four of the six
+transformers' `DynamicCache`, image prompt included, on a host pool, a device
+gather, and a Triton decode in the forward pass. Four sampling branches of one
+prompt hold 3.67x less KV than four dense caches. Decode through the kernel is
+still ~11 ms/step over dense — the same as the device gather — because the
+remaining cost is Python dispatch, not attention. Four of the six
 synchronization rules in
 [`docs/architecture.md`](docs/architecture.md) are exercised by
 `tests/SynchronizationRules.test.cpp`; the remaining two govern an asynchronous

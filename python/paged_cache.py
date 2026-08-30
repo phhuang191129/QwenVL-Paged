@@ -10,25 +10,34 @@ every layer's slice of a token range. One sequence's block table therefore backs
 all layers at once, and a `PagedLayer` is just a window onto its own layer's
 stride within those same frames.
 
-What this does *not* do is put the Triton kernel in the forward pass. `update`
-has to hand back contiguous K/V for torch's attention to consume, so every step
-gathers the sequence's blocks into a dense tensor. That gather is the cost the
-roadmap asked to have measured rather than hidden, and it is the concrete
-argument for a native paged kernel. Validating that kernel against a model is a
-separate problem from validating this cache against one.
+Prefill still gathers: the Triton kernel is decode-only, so a prompt longer than
+one token uses torch attention over a dense K/V. Decode writes the new token
+into its page and, when `use_kernel` is set, skips the gather. A registered
+attention implementation then launches Triton against the slab and the block
+table. That is the path that removes the 12 ms/step measured in week 19.
 
 Restrictions, all deliberate and all asserted rather than silently handled:
 batch size 1 and greedy decode per sequence, no beam reordering. Several
 sequences can share one pool, which is what `fork_paged_cache` is for, but they
-are stepped one at a time rather than batched. This exists to answer whether
-paged storage produces identical tokens, not to be a serving path.
+are stepped one at a time rather than batched.
 """
+
+import pathlib
+import sys
 
 import numpy as np
 import torch
 from transformers.cache_utils import Cache, CacheLayerMixin
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.models.qwen3_vl.modeling_qwen3_vl import eager_attention_forward
 
 import qwenvl_paged as qp
+
+_KERNEL = pathlib.Path(__file__).resolve().parent.parent / "tools" / "triton_kernel"
+if str(_KERNEL) not in sys.path:
+    sys.path.insert(0, str(_KERNEL))
+
+from paged_attention_decode import paged_attention_decode_partitioned
 
 DEFAULT_TOKENS_PER_BLOCK = 16
 SEQUENCE_ID = 1
@@ -41,11 +50,17 @@ class PagedPool:
     block spans all layers, so the sequence's capacity must grow once per token
     position, not once per layer per token position. `ensure_capacity` is
     idempotent so all `num_layers` callers can ask and only the first does work.
+
+    With `device="cuda"` the slab is device-resident and the allocator adopts its
+    address, which keeps writes and gathers off the PCIe bus. Two things stay
+    host-only in that mode and will fault if used: the swap backend, and the CPU
+    reference kernel reached through `KVCacheManager.decode`. Copy-on-write does
+    work, because `set_copy_hook` redirects the one site that moves bytes.
     """
 
     def __init__(self, *, num_layers, num_kv_heads, head_dim, max_blocks,
                  tokens_per_block=DEFAULT_TOKENS_PER_BLOCK, scatter=False,
-                 dtype=torch.float32):
+                 dtype=torch.float32, device="cpu", use_kernel=False):
         config = qp.AllocatorConfig()
         config.block_shape.tokens_per_block = tokens_per_block
         config.block_shape.num_layers = num_layers
@@ -59,16 +74,38 @@ class PagedPool:
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.dtype = dtype
+        self.device = torch.device(device)
+        self.use_kernel = use_kernel
+        if use_kernel:
+            assert self.device.type == "cuda", "the Triton kernel reads a device pool"
 
         # The slab is bytes, which is what C++ thinks it is, and torch reads it
         # through a zero-copy view at the model's dtype. Going through numpy at
         # the element dtype instead would rule out bfloat16, which numpy has no
         # type for and every real checkpoint here is stored in.
-        self.storage = np.zeros(qp.pool_bytes_for(config), dtype=np.uint8)
-        self.allocator = qp.MemoryAllocator(config, self.storage)
+        pool_bytes = qp.pool_bytes_for(config)
+        if self.device.type == "cpu":
+            self.storage = np.zeros(pool_bytes, dtype=np.uint8)
+            self.allocator = qp.MemoryAllocator(config, self.storage)
+            frames = torch.from_numpy(self.storage)
+        else:
+            # Only the address crosses, so the allocator cannot keep this alive
+            # for us; holding it on the pool is what stops it being collected
+            # out from under C++.
+            self.storage = torch.zeros(pool_bytes, dtype=torch.uint8, device=self.device)
+            self.allocator = qp.MemoryAllocator(config, self.storage.data_ptr(), pool_bytes)
+            frames = self.storage
+
         self.manager = qp.KVCacheManager(self.allocator)
-        self.frames = torch.from_numpy(self.storage).view(dtype).reshape(
+        self.frames = frames.view(dtype).reshape(
             max_blocks, qp.block_stride_for(config) // dtype.itemsize)
+
+        if self.device.type != "cpu":
+            # Copy-on-write is the one path that moves bytes, and its default is
+            # a host memcpy that would fault on this storage. Row `i` of frames
+            # is frame `i`, because a block id is an offset into the slab.
+            self.allocator.set_copy_hook(
+                lambda source, destination: self.frames[destination].copy_(self.frames[source]))
 
         self.layout = qp.KVBlockLayout()
         self.layout.shape = config.block_shape
@@ -116,12 +153,28 @@ class PagedPool:
                 assert self.manager.reserve_tokens(self.spacer_id, self.tokens_per_block), (
                     "pool exhausted reserving a spacer frame; raise max_blocks")
 
-    def stream_view(self, frame, layer_idx, stream):
-        """The [tokens_per_block, num_kv_heads, head_dim] slice of one frame."""
+    def stream_base(self, layer_idx, stream):
+        """Element offset of one layer's key or value slice within a frame."""
         base = self.layout.element_offset(layer_idx, stream, 0, 0)
         assert base is not None, "element_offset out of range"
+        return base
+
+    def stream_view(self, frame, layer_idx, stream):
+        """The [tokens_per_block, num_kv_heads, head_dim] slice of one frame."""
+        base = self.stream_base(layer_idx, stream)
         return self.frames[frame, base:base + self.block_span].reshape(
             self.tokens_per_block, self.num_kv_heads, self.head_dim)
+
+    def frame_index(self, sequence_id, count):
+        """The first `count` frames of a sequence, as an index tensor.
+
+        Rebuilt per call rather than cached. Copy-on-write remaps entries
+        without changing the table's length, so a cache would need invalidating
+        from inside the write path, and that is not worth doing before the cost
+        shows up in a measurement.
+        """
+        frames = self.block_table(sequence_id)[:count]
+        return torch.tensor(frames, dtype=torch.long, device=self.device)
 
     def writable_frame(self, sequence_id, token):
         """Resolves a token's frame, honoring copy-on-write before any write."""
@@ -171,9 +224,10 @@ class PagedLayer(CacheLayerMixin):
         self.pool.ensure_capacity(self.sequence_id, end)
 
         # [1, kv_heads, tokens, dim] -> [tokens, kv_heads, dim], matching the
-        # in-block layout so each block is one assignment.
-        keys = key_states[0].permute(1, 0, 2).to("cpu")
-        values = value_states[0].permute(1, 0, 2).to("cpu")
+        # in-block layout so each block is one assignment. This crosses to the
+        # host only when the pool is there.
+        keys = key_states[0].permute(1, 0, 2).to(self.pool.device)
+        values = value_states[0].permute(1, 0, 2).to(self.pool.device)
 
         tokens_per_block = self.pool.tokens_per_block
         position = start
@@ -188,7 +242,36 @@ class PagedLayer(CacheLayerMixin):
             position += count
 
         self.length = end
+        # Decode is one token. Returning it instead of the gathered context is
+        # what lets the attention implementation below launch Triton; torch
+        # attention would be wrong if it consumed this. Prefill still gathers.
+        if self.pool.use_kernel and new_tokens == 1:
+            return key_states, value_states
         return self._gather()
+
+    def attend_decode(self, query, scale):
+        """Runs Triton over this layer's pages. `query` is [batch, heads, 1, dim]."""
+        q = query[:, :, 0, :].contiguous()
+        needed = -(-self.length // self.pool.tokens_per_block)
+        table = self.pool.frame_index(self.sequence_id, needed).to(torch.int32).unsqueeze(0)
+        context = torch.tensor([self.length], dtype=torch.int32, device=self.pool.device)
+        layout = self.pool.layout
+        out = paged_attention_decode_partitioned(
+            self.pool.frames,
+            table,
+            context,
+            q,
+            layer=self.layer_idx,
+            layer_stride=layout.layer_stride(),
+            stream_stride=layout.stream_stride(),
+            token_stride=layout.token_stride(),
+            head_stride=layout.head_stride(),
+            tokens_per_block=self.pool.tokens_per_block,
+            num_kv_heads=self.pool.num_kv_heads,
+            scale=scale,
+        )
+        # Kernel emits [batch, heads, dim]; eager/sdpa emit [batch, q, heads, dim].
+        return out.unsqueeze(1).contiguous()
 
     def _gather(self):
         """Reassembles the sequence into the contiguous tensors attention wants.
@@ -197,24 +280,22 @@ class PagedLayer(CacheLayerMixin):
         paged kernel is worth having: the blocks are already the right bytes in
         the right order, and this copies all of them anyway.
         """
-        frames = self.pool.block_table(self.sequence_id)
         tokens_per_block = self.pool.tokens_per_block
+        needed = -(-self.length // tokens_per_block)
+        index = self.pool.frame_index(self.sequence_id, needed)
 
-        key_blocks, value_blocks, remaining = [], [], self.length
-        for frame in frames:
-            if remaining <= 0:
-                break
-            count = min(tokens_per_block, remaining)
-            key_blocks.append(self.pool.stream_view(frame, self.layer_idx, qp.KVStream.Key)[:count])
-            value_blocks.append(self.pool.stream_view(frame, self.layer_idx, qp.KVStream.Value)[:count])
-            remaining -= count
+        def stream(kind):
+            # One indexed read of every block at once. Slicing the blocks
+            # individually and concatenating them is the same bytes, but it is
+            # a few thousand tensor ops per step at this context length, and at
+            # that point the launch overhead costs more than the copy does.
+            base = self.pool.stream_base(self.layer_idx, kind)
+            rows = self.pool.frames[index, base:base + self.pool.block_span]
+            return rows.reshape(-1, self.pool.num_kv_heads, self.pool.head_dim)[:self.length]
 
-        keys = torch.cat(key_blocks)
-        values = torch.cat(value_blocks)
+        keys, values = stream(qp.KVStream.Key), stream(qp.KVStream.Value)
         self.gathered_elements += keys.numel() + values.numel()
 
-        # Concatenated on the host first so the whole context crosses to the
-        # device once per stream rather than once per block.
         def to_model(tensor):
             return tensor.permute(1, 0, 2).unsqueeze(0).to(self.device)
 
@@ -245,8 +326,32 @@ class PagedLayer(CacheLayerMixin):
         pass
 
 
+def paged_attention_forward(module, query, key, value, attention_mask, scaling,
+                            dropout=0.0, **kwargs):
+    """Decode through Triton; prefill through the dense implementation.
+
+    Bound onto each text attention module by `install_paged_attention`. Vision
+    layers never get a `_paged_layer` and fall through, so this can be the
+    process-wide `qwenvl_paged` implementation without touching the ViT.
+    """
+    layer = getattr(module, "_paged_layer", None)
+    if layer is not None and layer.pool.use_kernel and query.shape[-2] == 1:
+        return layer.attend_decode(query, scale=scaling), None
+    dense = ALL_ATTENTION_FUNCTIONS.get("sdpa", eager_attention_forward)
+    return dense(module, query, key, value, attention_mask, scaling=scaling,
+                 dropout=dropout, **kwargs)
+
+
+def install_paged_attention(model, cache):
+    """Points each text attention module at its `PagedLayer` and selects it."""
+    ALL_ATTENTION_FUNCTIONS.register("qwenvl_paged", paged_attention_forward)
+    for decoder_layer, paged_layer in zip(model.model.language_model.layers, cache.layers):
+        decoder_layer.self_attn._paged_layer = paged_layer
+        decoder_layer.self_attn.config._attn_implementation = "qwenvl_paged"
+
+
 def build_paged_cache(text_config, max_blocks, tokens_per_block=DEFAULT_TOKENS_PER_BLOCK,
-                      scatter=False, dtype=torch.float32):
+                      scatter=False, dtype=torch.float32, device="cpu", use_kernel=False):
     """Returns a transformers Cache backed by one paged pool, and the pool."""
     head_dim = getattr(text_config, "head_dim", None) or (
         text_config.hidden_size // text_config.num_attention_heads)
@@ -259,6 +364,8 @@ def build_paged_cache(text_config, max_blocks, tokens_per_block=DEFAULT_TOKENS_P
         tokens_per_block=tokens_per_block,
         scatter=scatter,
         dtype=dtype,
+        device=device,
+        use_kernel=use_kernel,
     )
     layers = [PagedLayer(pool, index, pool.root_id)
               for index in range(text_config.num_hidden_layers)]

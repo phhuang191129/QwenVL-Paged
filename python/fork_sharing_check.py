@@ -21,7 +21,8 @@ dense cache.
 
 Frames are not scattered here. The other two gates cover that, and a spacer
 sequence would sit in the middle of the frame accounting this script exists to
-report.
+report. The pool is device-resident, so each first write goes through the copy
+hook rather than a host memcpy -- the path a serving loop would actually take.
 
 Usage:
     PYTHONPATH=build .venv/bin/python python/fork_sharing_check.py
@@ -94,7 +95,9 @@ def main() -> int:
         reference_caches.append(cache)
 
     pool_blocks = prompt_blocks + BRANCHES * (2 + NEW_TOKENS // DEFAULT_TOKENS_PER_BLOCK) + 8
-    paged, pool = build_paged_cache(text, max_blocks=pool_blocks, dtype=DTYPE)
+    # Device-resident: this is the path that has to go through the copy hook
+    # rather than a host memcpy, and it is the one a serving loop would use.
+    paged, pool = build_paged_cache(text, max_blocks=pool_blocks, dtype=DTYPE, device="cuda")
     prefill(model, inputs, paged)
     prompt_frames = pool.block_table(pool.root_id)
 
