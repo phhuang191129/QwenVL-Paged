@@ -361,8 +361,13 @@ are token-identical to `DynamicCache` over 20 greedy steps. Prefill still
 gathers; decode writes the new token into its page and launches Triton. At this
 prompt the host path costs 51 ms/step over dense and the two device paths both
 cost ~11 ms/step — putting the kernel in the path did not move the number, so
-that 11 ms is the Python write and dispatch, not the gather. See
-`docs/performance.md` week 20.
+that 11 ms is write (~4 ms), rebuilding the block table every layer (~3 ms),
+and launch (~3 ms) — the kernel replaced the gather and spent the same amount
+building a table torch already had. See `docs/performance.md` week 21.
+
+```bash
+PYTHONPATH=build .venv/bin/python python/decode_breakdown.py
+```
 
 `python/fork_sharing_check.py` covers the property paging exists for, now on the
 device pool so copy-on-write goes through the hook rather than a host memcpy.

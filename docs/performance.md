@@ -1302,3 +1302,66 @@ frame is not resolved here.
 - **No CUDA graph, no batched decode.** One sequence, one token, 28 separate
   launches per step.
 
+## Week 21: Where The 11 ms Actually Goes
+
+The kernel and the gather cost the same 11 ms/step. This splits that number
+so the next change is chosen from a table.
+
+```bash
+PYTHONPATH=build .venv/bin/python python/decode_breakdown.py
+```
+
+Prefill is excluded. Each decode step is timed with a CUDA sync around writing
+the new token, assembling the block table, launching Triton, and gathering, on
+the same 1,242-token image prompt as week 20.
+
+### Finding 1: the 11 ms is three buckets of similar size, and the kernel replaced the wrong one
+
+| Bucket | Device gather | Device kernel |
+| --- | ---: | ---: |
+| Write (page the new token) | 4.16 ms/step | 3.88 ms/step |
+| Gather | 4.79 ms/step | — |
+| Block table | — | 3.42 ms/step |
+| Triton launch | — | 3.38 ms/step |
+| Rest of the model | 30.44 ms/step | 29.33 ms/step |
+| Wall | 39.39 ms/step | 40.02 ms/step |
+| Versus dense (28.62 ms/step) | +10.77 | +11.40 |
+
+The model body (`other`) matches the dense step, which is the sanity check:
+the 11 ms is paged-only work. Write is ~4 ms on both paths and is the cost of
+`update()` — pybind `ensure_token_writable` and a slice write, 28 times. Gather
+was 4.8 ms. The kernel removed it and spent 3.4 ms building a block-table
+tensor plus 3.4 ms launching, which is why the wall did not move.
+
+Launch is 120 µs per layer, not the tens of microseconds the isolated kernel
+benchmark reported. That gap is the per-call scratch allocations in the
+partitioned wrapper plus two launches, 28 times.
+
+### Finding 2: the cheapest next cut is the block table, not CUDA graphs
+
+The block table is the same for every layer of a step. Today `attend_decode`
+builds it from a Python list on every layer, so 28 identical host-to-device
+copies account for 3.4 ms. Building it once per token deletes that bucket
+without a graph and without touching the write path.
+
+CUDA graphs would help the 3.4 ms of launches, and they would not help the
+7.3 ms of write-plus-table that sit outside any captured region. Do the table
+first; the graph question is clearer once that 3.4 ms is gone.
+
+### Verification status
+
+| Check | Status |
+| --- | --- |
+| Dense / gather / kernel decode-only walls reproduce the week 20 gap | pass, +11 ms |
+| `other` matches the dense step | pass |
+| 560 decode updates on each paged path | pass |
+
+### Known limitations of these numbers
+
+- **Sync around every bucket.** That is what makes the split honest, and it
+  also makes each bucket a lower bound on overlapped execution. A serving loop
+  that did not sync per layer could hide some of the 120 µs launches behind
+  the next layer's `update()`.
+- **One prompt, 20 tokens, batch 1.** Same shape as week 20 on purpose.
+- **No change to the kernel or the write path.** This file is a measurement.
+
