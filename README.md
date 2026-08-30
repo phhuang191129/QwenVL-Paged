@@ -84,6 +84,7 @@ tools/trace_gen/        Qwen3-VL trace generator (Python, processor geometry onl
 tools/trace_replay/     Trace replay driver + contiguous-reservation baseline
 tools/golden_export/    Golden fixture exporter and its pre-GPU verification gate
 tools/triton_kernel/    Triton decode kernel, fixture runner, and GPU benchmark
+python/                 pybind11 bindings and the live allocator-to-kernel check
 traces/                 Generated request traces (JSONL)
 fixtures/               Golden attention vectors (.npz) shared by both backends
 results/                Measured CSV output backing docs/performance.md
@@ -300,13 +301,30 @@ Measured on an NVIDIA L4, with full context and caveats in
   traffic doubles. Making the query head the fast axis is a three-line fix, and it
   buys what fusing the grouped-query heads would have, without halving the grid.
 
-The block pool is now a single contiguous slab with frame `i` at
+The block pool is a single contiguous slab with frame `i` at
 `i * block_stride_bytes()`, so a `PhysicalBlockId` is an offset rather than a
 handle to an independent allocation. That is what the kernel's
-`physical_id * elements_per_block` addressing needs, and it reduces a
-device-backed pool to one allocation site. The kernel still reads a device pool
-supplied by the caller: the layouts are proven compatible, but nothing has run
-against memory `MemoryAllocator` owns yet.
+`physical_id * elements_per_block` addressing needs, and it lets the whole pool
+mirror to the device in one transfer instead of a per-frame gather.
+
+`python/live_pool_check.py` runs the kernel against a pool the C++ allocator is
+managing, with no fixture in the loop: Python owns the slab, `MemoryAllocator`
+adopts it, and the cache manager forks a sequence, materializes the child by
+copy-on-write, and hands a released sequence's frames to another before the
+kernel reads the result. It agrees with the CPU reference to 5.4e-07.
+
+```bash
+cmake -S . -B build -DQWENVL_BUILD_PYTHON=ON \
+    -Dpybind11_DIR=$(.venv/bin/python -c 'import pybind11;print(pybind11.get_cmake_dir())') \
+    -DPython_EXECUTABLE=$PWD/.venv/bin/python
+cmake --build build -j
+PYTHONPATH=build .venv/bin/python python/live_pool_check.py
+```
+
+The pool is still host memory mirrored per run rather than device-resident.
+`copy_block`, the swap backend, and `CacheView::block_bytes` all dereference
+frame bytes on the host, so adopting device memory needs those three sites to
+take a copy hook first — the bookkeeping itself already touches no bytes.
 
 ## Usage
 
@@ -407,9 +425,10 @@ benchmarked at the real block shape
 ([`docs/performance.md`](docs/performance.md)).
 
 No model forward pass is wired up yet, so there are no end-to-end latency or
-throughput numbers. On the GPU side the block pool is still supplied by the
-caller rather than allocated by `MemoryAllocator`, though the two now share a
-layout. Four of the six synchronization rules in
+throughput numbers. The Triton kernel does now read a pool the allocator manages
+through the pybind11 module under `python/`, though that pool is host memory
+mirrored to the device rather than device-resident. Four of the six
+synchronization rules in
 [`docs/architecture.md`](docs/architecture.md) are exercised by
 `tests/SynchronizationRules.test.cpp`; the remaining two govern an asynchronous
 backend that does not exist yet and are named as untested rather than faked. The

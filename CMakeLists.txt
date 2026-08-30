@@ -86,6 +86,22 @@ target_link_libraries(qwenvl_trace_replay PRIVATE qwenvl_trace_replay_core)
 add_executable(qwenvl_golden_export tools/golden_export/main.cpp)
 target_link_libraries(qwenvl_golden_export PRIVATE qwenvl_paged_core)
 
+# Python bindings, so the Triton kernel can read a pool this allocator manages
+# instead of an exported snapshot. Off by default: the C++ build must not start
+# depending on a Python toolchain.
+option(QWENVL_BUILD_PYTHON "Build the pybind11 module" OFF)
+if(QWENVL_BUILD_PYTHON)
+    # FindPython rather than pybind11's legacy detection, which picks up the
+    # system interpreter ahead of the uv-managed venv this project targets and
+    # then fails on missing Python.h. Pass -DPython_EXECUTABLE=.venv/bin/python.
+    set(PYBIND11_FINDPYTHON ON)
+    find_package(pybind11 CONFIG REQUIRED)
+    set_property(TARGET qwenvl_paged_core PROPERTY POSITION_INDEPENDENT_CODE ON)
+    pybind11_add_module(qwenvl_paged_python python/bindings.cpp)
+    target_link_libraries(qwenvl_paged_python PRIVATE qwenvl_paged_core)
+    set_target_properties(qwenvl_paged_python PROPERTIES OUTPUT_NAME qwenvl_paged)
+endif()
+
 add_executable(TraceReplay_test tests/TraceReplay.test.cpp)
 target_link_libraries(TraceReplay_test PRIVATE qwenvl_trace_replay_core GTest::gtest_main)
 target_compile_definitions(TraceReplay_test PRIVATE QWENVL_TRACE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/traces")

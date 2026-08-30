@@ -55,6 +55,20 @@ struct PhysicalBlockInfo {
     std::uint64_t generation{0};
 };
 
+/**
+ * @brief Returns the byte distance between consecutive frames for a config.
+ *
+ * The block's byte size rounded up to the configured alignment. Exposed so a
+ * caller sizing storage for the adopting constructor arrives at the same stride
+ * the allocator will use.
+ */
+[[nodiscard]] std::size_t block_stride_for(const AllocatorConfig& config) noexcept;
+
+/**
+ * @brief Returns the total bytes a pool for this config needs.
+ */
+[[nodiscard]] std::size_t pool_bytes_for(const AllocatorConfig& config) noexcept;
+
 class MemoryAllocator;
 
 /**
@@ -81,9 +95,27 @@ using EvictionCandidateSelector =
 class MemoryAllocator {
 public:
     /**
-     * @brief Creates a fixed-capacity CPU block pool.
+     * @brief Creates a fixed-capacity block pool over storage it allocates itself.
      */
     explicit MemoryAllocator(AllocatorConfig config);
+
+    /**
+     * @brief Creates a pool over a slab the caller owns.
+     *
+     * `adopted_pool` must hold at least `pool_bytes_for(config)` bytes, meet the
+     * configured alignment, and outlive the allocator. This is the seam a device
+     * pool arrives through: torch allocates the tensor and keeps it alive, the
+     * allocator does the bookkeeping, and neither has to know about the other's
+     * allocator.
+     *
+     * Note what an adopted slab must still be, though. `copy_block`, the swap
+     * backend, and the CPU reference kernel reached through `CacheView` all
+     * dereference frame bytes on the host, so storage that is not
+     * host-addressable silently disables copy-on-write, swapping, and
+     * `paged_attention_decode`. Adopting device memory means making those three
+     * sites device-aware first; adopting pinned host memory works today.
+     */
+    MemoryAllocator(AllocatorConfig config, std::byte* adopted_pool);
 
     ~MemoryAllocator() = default;
 
@@ -226,15 +258,23 @@ public:
      */
     [[nodiscard]] bool pinned_memory_requested() const noexcept;
 
+    /**
+     * @brief Returns true when the slab belongs to the caller rather than the pool.
+     */
+    [[nodiscard]] bool owns_pool() const noexcept;
+
 private:
     static void release_pool_memory(std::byte* ptr) noexcept;
+
+    void bind_frames(std::byte* base);
 
     AllocatorConfig config_{};
     std::size_t block_stride_bytes_{0};
     std::size_t pool_bytes_{0};
-    std::unique_ptr<std::byte, decltype(&MemoryAllocator::release_pool_memory)> pool_{
+    std::unique_ptr<std::byte, decltype(&MemoryAllocator::release_pool_memory)> owned_pool_{
         nullptr,
         &MemoryAllocator::release_pool_memory};
+    std::byte* pool_base_{nullptr};
     std::vector<PhysicalBlock> blocks_;
     std::vector<PhysicalBlockInfo> infos_;
     std::vector<PhysicalBlockId> free_list_;

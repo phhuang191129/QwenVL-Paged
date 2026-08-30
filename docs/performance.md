@@ -837,30 +837,101 @@ a live observation from a stale one. The id matches and the address matches, and
 only `generation` reveals that the frame has been through the free list. The
 counter went from redundant to load-bearing.
 
+### Finding 4: the kernel now reads a pool the allocator is managing
+
+Everything above still validated the kernel against a file. `cow_and_recycled_frames`
+is a better file than the other four, but the C++ side froze a pool to disk and
+Python read it back, so nothing established that the kernel could read a pool the
+allocator was *actively* managing.
+
+`python/bindings.cpp` closes that. Ownership runs one way: Python allocates the
+slab, `MemoryAllocator` adopts the pointer, and a `keep_alive` makes the lifetime
+contract something Python cannot violate. That keeps CUDA out of a core that is
+still pure C++17 and lets the pool be a tensor the kernel takes directly, which
+is the same split vLLM makes between bookkeeping and storage. The C++ build does
+not learn about Python: the module is behind `QWENVL_BUILD_PYTHON`, off by
+default.
+
+`python/live_pool_check.py` then runs the seam with no fixture anywhere in it. It
+forks a sequence, materializes the child by copy-on-write, releases a sequence
+and hands its frames to another, calls the CPU reference kernel through the
+bindings, mirrors the slab to the device, and runs Triton against the block
+tables C++ produced.
+
+```
+  parent   frames [11, 10, 9]  context 40
+  child    frames [8, 7, 6]  (all materialized by copy-on-write)
+  victim   frames [5, 4, 3]  released
+  recycled frames [3, 4]  context 17, 15 stale slots past its end
+
+mirrored the slab to device in 1 transfer of 0.75 MiB
+
+  pass  parent                   max abs diff 5.364e-07
+  pass  child (copy-on-write)    max abs diff 3.576e-07
+  pass  recycled (stale tail)    max abs diff 3.576e-07
+```
+
+The single transfer is the part finding 1 paid for. It is correct only because a
+physical block id is an offset into one slab, so host frame `i` and device frame
+`i` land in the same place. Against the per-frame allocations this allocator used
+to make it would have had to be a gather of 12 separate copies, and the kernel's
+`physical_id * elements_per_block` addressing would have had nothing to compute
+against.
+
+### Finding 5: a device-resident pool is blocked on three host dereferences
+
+The obvious next move is to adopt a device tensor instead of a host one and drop
+the mirror. That does not work yet, and the reason is worth recording because it
+is not visible from the allocator's interface.
+
+Three sites in the core dereference frame bytes on the host:
+
+| Site | What breaks |
+| --- | --- |
+| `MemoryAllocator::copy_block` | `std::memcpy` — copy-on-write |
+| `HostSwapBackend::store` / `load` | `std::memcpy` — swap out and back in |
+| `CacheView::block_bytes`, read through by `paged_attention_decode` and `slot<T>` | the CPU reference kernel, which is the oracle everything is checked against |
+
+Adopting device memory today would compile, link, and segfault on the first
+fork. The allocator's *bookkeeping* is already device-ready — ids, refcounts,
+free list, generations touch no bytes — so this is three call sites needing a
+copy hook, not a redesign. It is also why the pool here is host memory mirrored
+per run rather than device-resident.
+
 ### Verification status
 
 | Check | Status |
 | --- | --- |
 | Every frame sits at `pool_base() + id * block_stride_bytes()` | pass |
 | Frames do not overlap, across the whole pool | pass |
-| Refactor changed nothing observable | pass, byte-identical fixtures and 143 tests |
-| Kernel reads a pool churned by fork, copy-on-write, and recycle | pass, 8.9e-08 |
+| Slab refactor changed nothing observable | pass, byte-identical fixtures and 143 tests |
+| Kernel reads a fixture pool churned by fork, copy-on-write, and recycle | pass, 8.9e-08 |
 | Exporter's churn premises hold rather than being assumed | pass, asserted in the exporter |
+| Allocator adopts caller-owned storage at the stride it computes | pass |
+| Kernel matches the CPU oracle on a live allocator-managed pool, no fixture | pass, 5.4e-07 |
+| Whole pool mirrors to device in one transfer | pass, 0.75 MiB in 1 copy |
 | Synchronization rules exercised | 4 of 6, with 3 and 4 named above |
 
-Full suite: 150 tests pass. GPU fixture checks: 20 pass.
+Full suite: 153 tests pass. GPU fixture checks: 20 pass.
 
 ### Known limitations of these numbers
 
-- **The pool is still host memory.** The slab makes a device-backed allocator a
-  one-site change, but that site has not been changed, and no kernel has yet run
-  against memory the C++ allocator owns. The seam is proven layout-compatible,
-  not yet connected.
+- **The pool is host memory mirrored to the device, not device-resident.** The
+  seam is connected and correct, but a serving engine cannot copy the pool per
+  step. Finding 5 names the three sites that stand between here and a device
+  pool.
+- **No timing claim is made about the bridge.** `live_pool_check.py` is a
+  correctness harness. It writes KV element by element from Python, which is far
+  slower than any real path, and nothing here measures call overhead across the
+  binding.
 - **The churn fixture is small.** Ten frames, 4-token blocks, head_dim 8. It is
-  built to make paging bugs visible, not to be representative; the real block
-  shape is exercised by `batched_head_dim_128` and the benchmarks.
-- **Copy-on-write is exercised, swap is only half-exercised.** The churn fixture
-  covers fork, copy-on-write, release, and recycle. Swap-out and swap-in appear
-  only in the rule 6 tests, never in a fixture the GPU kernel reads.
+  built to make paging bugs visible, not to be representative; the live check
+  runs a larger shape and the real one is exercised by the benchmarks.
+- **Copy-on-write is exercised, swap is only half-exercised.** Both the churn
+  fixture and the live check cover fork, copy-on-write, release, and recycle.
+  Swap-out and swap-in appear only in the rule 6 tests, never in anything the GPU
+  kernel reads.
 - **Rules 3 and 4 remain contractual.** They are the two that matter most once a
   backend is asynchronous, and they are the two with no test.
+- **Still no model.** This connects the allocator to the kernel, not either to
+  Qwen3-VL. There is still no end-to-end number and no token-identical gate.

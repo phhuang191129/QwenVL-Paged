@@ -66,6 +66,53 @@ TEST(MemoryAllocatorTest, PoolIsOneSlabAddressableByBlockId) {
     }
 }
 
+TEST(MemoryAllocatorTest, AdoptsASlabTheCallerOwns) {
+    // How a device pool arrives: torch allocates and keeps the tensor alive, the
+    // allocator only does the bookkeeping. Sizing it from the free helpers has to
+    // agree with what the allocator then computes for itself, or the last frame
+    // hangs off the end of the caller's buffer.
+    constexpr std::uint32_t kBlockCount = 16;
+    const AllocatorConfig config = make_test_config(kBlockCount);
+
+    std::vector<std::byte> storage(pool_bytes_for(config));
+    MemoryAllocator allocator(config, storage.data());
+
+    EXPECT_FALSE(allocator.owns_pool());
+    EXPECT_EQ(allocator.pool_base(), storage.data());
+    EXPECT_EQ(allocator.block_stride_bytes(), block_stride_for(config));
+    EXPECT_EQ(allocator.pool_bytes(), storage.size());
+
+    for (std::uint32_t id = 0; id < kBlockCount; ++id) {
+        const PhysicalBlock* frame = allocator.block(id);
+        ASSERT_NE(frame, nullptr);
+        EXPECT_EQ(frame->data(), storage.data() + id * allocator.block_stride_bytes());
+    }
+
+    // The last frame must end exactly at the end of what the caller allocated.
+    const PhysicalBlock* last = allocator.block(kBlockCount - 1);
+    ASSERT_NE(last, nullptr);
+    EXPECT_EQ(last->data() + last->size_bytes(), storage.data() + storage.size());
+}
+
+TEST(MemoryAllocatorTest, AdoptedSlabIsWrittenThroughRatherThanCopied) {
+    const AllocatorConfig config = make_test_config(4);
+    std::vector<std::byte> storage(pool_bytes_for(config), std::byte{0});
+    MemoryAllocator allocator(config, storage.data());
+
+    const std::optional<PhysicalBlockId> id = allocator.allocate();
+    ASSERT_TRUE(id.has_value());
+    allocator.block(*id)->data()[0] = std::byte{0xCD};
+
+    EXPECT_EQ(storage[*id * allocator.block_stride_bytes()], std::byte{0xCD});
+}
+
+TEST(MemoryAllocatorTest, OwnedPoolReportsOwnership) {
+    MemoryAllocator allocator(make_test_config());
+
+    EXPECT_TRUE(allocator.owns_pool());
+    EXPECT_NE(allocator.pool_base(), nullptr);
+}
+
 TEST(MemoryAllocatorTest, FramesDoNotOverlap) {
     constexpr std::uint32_t kBlockCount = 8;
     MemoryAllocator allocator(make_test_config(kBlockCount));

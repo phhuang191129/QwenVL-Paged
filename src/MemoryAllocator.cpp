@@ -15,26 +15,49 @@ std::size_t round_up(std::size_t value, std::size_t alignment) noexcept {
     return ((value + alignment - 1) / alignment) * alignment;
 }
 
+std::size_t effective_alignment(const AllocatorConfig& config) noexcept {
+    return config.memory_options.alignment_bytes == 0 ? kDefaultBlockAlignmentBytes
+                                                      : config.memory_options.alignment_bytes;
+}
+
 } // namespace
 
-MemoryAllocator::MemoryAllocator(AllocatorConfig config) : config_(config) {
-    const std::size_t alignment =
-        config_.memory_options.alignment_bytes == 0 ? kDefaultBlockAlignmentBytes
-                                                    : config_.memory_options.alignment_bytes;
-
+std::size_t block_stride_for(const AllocatorConfig& config) noexcept {
     // Rounding the stride to the alignment keeps every frame aligned, not just
     // the pool base, so a backend can DMA any single frame on its own.
-    block_stride_bytes_ = round_up(config_.block_shape.byte_size(), alignment);
-    if (block_stride_bytes_ == 0) {
-        block_stride_bytes_ = alignment;
-    }
+    const std::size_t alignment = effective_alignment(config);
+    const std::size_t stride = round_up(config.block_shape.byte_size(), alignment);
+    return stride == 0 ? alignment : stride;
+}
+
+std::size_t pool_bytes_for(const AllocatorConfig& config) noexcept {
+    return block_stride_for(config) * config.max_blocks;
+}
+
+MemoryAllocator::MemoryAllocator(AllocatorConfig config) : config_(config) {
+    block_stride_bytes_ = block_stride_for(config_);
+    pool_bytes_ = block_stride_bytes_ * config_.max_blocks;
 
     // std::aligned_alloc requires a size that is a multiple of the alignment,
     // which a whole number of aligned strides already is.
-    pool_bytes_ = block_stride_bytes_ * config_.max_blocks;
     if (pool_bytes_ > 0) {
-        pool_.reset(static_cast<std::byte*>(std::aligned_alloc(alignment, pool_bytes_)));
+        owned_pool_.reset(
+            static_cast<std::byte*>(std::aligned_alloc(effective_alignment(config_), pool_bytes_)));
     }
+
+    bind_frames(owned_pool_.get());
+}
+
+MemoryAllocator::MemoryAllocator(AllocatorConfig config, std::byte* adopted_pool)
+    : config_(config) {
+    block_stride_bytes_ = block_stride_for(config_);
+    pool_bytes_ = block_stride_bytes_ * config_.max_blocks;
+
+    bind_frames(adopted_pool);
+}
+
+void MemoryAllocator::bind_frames(std::byte* base) {
+    pool_base_ = base;
 
     blocks_.reserve(config_.max_blocks);
     infos_.reserve(config_.max_blocks);
@@ -42,7 +65,8 @@ MemoryAllocator::MemoryAllocator(AllocatorConfig config) : config_(config) {
 
     for (std::uint32_t i = 0; i < config_.max_blocks; ++i) {
         const PhysicalBlockId id = i;
-        std::byte* storage = pool_ == nullptr ? nullptr : pool_.get() + static_cast<std::size_t>(id) * block_stride_bytes_;
+        std::byte* storage =
+            base == nullptr ? nullptr : base + static_cast<std::size_t>(id) * block_stride_bytes_;
         blocks_.emplace_back(id, config_.block_shape, storage, block_stride_bytes_);
 
         PhysicalBlockInfo info;
@@ -240,11 +264,11 @@ bool MemoryAllocator::can_allocate(std::uint32_t block_count) const noexcept {
 }
 
 std::byte* MemoryAllocator::pool_base() noexcept {
-    return pool_.get();
+    return pool_base_;
 }
 
 const std::byte* MemoryAllocator::pool_base() const noexcept {
-    return pool_.get();
+    return pool_base_;
 }
 
 std::size_t MemoryAllocator::block_stride_bytes() const noexcept {
@@ -261,6 +285,10 @@ std::size_t MemoryAllocator::alignment_bytes() const noexcept {
 
 bool MemoryAllocator::pinned_memory_requested() const noexcept {
     return config_.memory_options.prefer_pinned_memory;
+}
+
+bool MemoryAllocator::owns_pool() const noexcept {
+    return owned_pool_ != nullptr;
 }
 
 void MemoryAllocator::release_pool_memory(std::byte* ptr) noexcept {
