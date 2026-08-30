@@ -130,6 +130,13 @@ class PagedPool:
         if scatter:
             assert self.manager.create_sequence(self.spacer_id, self.spacer_id)
 
+        # Device tensors shared by every layer of a step. Invalidated when a
+        # write remaps a frame or the table grows; see decode_inputs.
+        self._host_frames = {}
+        self._dev_table = {}
+        self._dev_context = {}
+        self._cached_length = {}
+
     def fork(self, parent_id, child_id):
         """Branches a sequence, sharing every one of its blocks until written."""
         assert self.manager.fork_sequence(parent_id, child_id, child_id)
@@ -152,6 +159,7 @@ class PagedPool:
             if self.scatter:
                 assert self.manager.reserve_tokens(self.spacer_id, self.tokens_per_block), (
                     "pool exhausted reserving a spacer frame; raise max_blocks")
+            self._invalidate_table(sequence_id)
 
     def stream_base(self, layer_idx, stream):
         """Element offset of one layer's key or value slice within a frame."""
@@ -165,21 +173,50 @@ class PagedPool:
         return self.frames[frame, base:base + self.block_span].reshape(
             self.tokens_per_block, self.num_kv_heads, self.head_dim)
 
-    def frame_index(self, sequence_id, count):
-        """The first `count` frames of a sequence, as an index tensor.
+    def _invalidate_table(self, sequence_id):
+        self._host_frames.pop(sequence_id, None)
+        self._dev_table.pop(sequence_id, None)
+        self._dev_context.pop(sequence_id, None)
+        self._cached_length.pop(sequence_id, None)
 
-        Rebuilt per call rather than cached. Copy-on-write remaps entries
-        without changing the table's length, so a cache would need invalidating
-        from inside the write path, and that is not worth doing before the cost
-        shows up in a measurement.
+    def decode_inputs(self, sequence_id, length):
+        """Block table and context length for a decode launch, cached per sequence.
+
+        Every layer of a step reads the same frames. Rebuilding that tensor 28
+        times was 3.4 ms/step; the host list is what lets a remapping write
+        invalidate without a device-to-host sync.
         """
-        frames = self.block_table(sequence_id)[:count]
-        return torch.tensor(frames, dtype=torch.long, device=self.device)
+        needed = -(-length // self.tokens_per_block)
+        table = self._dev_table.get(sequence_id)
+        if table is None or table.shape[1] != needed:
+            host = self.block_table(sequence_id)[:needed]
+            self._host_frames[sequence_id] = host
+            table = torch.tensor(host, dtype=torch.int32, device=self.device).unsqueeze(0)
+            self._dev_table[sequence_id] = table
+
+        context = self._dev_context.get(sequence_id)
+        if context is None or self._cached_length[sequence_id] != length:
+            # New tensor, not fill_: a previous layer's kernel may still be
+            # reading the old one.
+            context = torch.tensor([length], dtype=torch.int32, device=self.device)
+            self._dev_context[sequence_id] = context
+            self._cached_length[sequence_id] = length
+        return table, context
+
+    def frame_index(self, sequence_id, count):
+        """The first `count` frames of a sequence, as an index tensor."""
+        table, _ = self.decode_inputs(sequence_id, count * self.tokens_per_block)
+        return table[0, :count].to(torch.long)
 
     def writable_frame(self, sequence_id, token):
         """Resolves a token's frame, honoring copy-on-write before any write."""
         frame = self.manager.ensure_token_writable(sequence_id, token)
         assert frame is not None, f"ensure_token_writable failed at token {token}"
+        host = self._host_frames.get(sequence_id)
+        if host is not None:
+            logical = token // self.tokens_per_block
+            if logical >= len(host) or host[logical] != frame:
+                self._invalidate_table(sequence_id)
         return frame
 
     def block_table(self, sequence_id):
@@ -252,9 +289,7 @@ class PagedLayer(CacheLayerMixin):
     def attend_decode(self, query, scale):
         """Runs Triton over this layer's pages. `query` is [batch, heads, 1, dim]."""
         q = query[:, :, 0, :].contiguous()
-        needed = -(-self.length // self.pool.tokens_per_block)
-        table = self.pool.frame_index(self.sequence_id, needed).to(torch.int32).unsqueeze(0)
-        context = torch.tensor([self.length], dtype=torch.int32, device=self.pool.device)
+        table, context = self.pool.decode_inputs(self.sequence_id, self.length)
         layout = self.pool.layout
         out = paged_attention_decode_partitioned(
             self.pool.frames,

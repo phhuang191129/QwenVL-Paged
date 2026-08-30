@@ -69,12 +69,10 @@ def instrument(buckets: Buckets):
         return out
 
     def attend(self, query, scale):
+        q = query[:, :, 0, :].contiguous()
         torch.cuda.synchronize()
         started = time.perf_counter()
-        q = query[:, :, 0, :].contiguous()
-        needed = -(-self.length // self.pool.tokens_per_block)
-        table = self.pool.frame_index(self.sequence_id, needed).to(torch.int32).unsqueeze(0)
-        context = torch.tensor([self.length], dtype=torch.int32, device=self.pool.device)
+        table, context = self.pool.decode_inputs(self.sequence_id, self.length)
         torch.cuda.synchronize()
         buckets.add("table", time.perf_counter() - started)
 

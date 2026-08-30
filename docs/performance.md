@@ -1348,6 +1348,24 @@ CUDA graphs would help the 3.4 ms of launches, and they would not help the
 7.3 ms of write-plus-table that sit outside any captured region. Do the table
 first; the graph question is clearer once that 3.4 ms is gone.
 
+### Finding 3: caching the table dropped it from 3.4 ms to 0.3 ms
+
+`decode_inputs` keeps the int32 table on the pool. A remapping write compares
+against a host-side copy of the frame ids, so invalidation does not sync the
+device. The context-length tensor is replaced when the length changes, not
+filled in place, because a previous launch may still be reading it.
+
+| Bucket | Kernel before | Kernel after |
+| --- | ---: | ---: |
+| Write | 3.88 ms/step | 3.98 ms/step |
+| Table | 3.42 | 0.26 |
+| Launch | 3.38 | 3.41 |
+| Versus dense | +11.40 | +7.57 |
+
+The wall moved by the table bucket, not by hope. Write and launch did not.
+What remains is ~4 ms of `update()` and ~3.4 ms of per-layer launch; those
+are the two questions left, and they are now the same size.
+
 ### Verification status
 
 | Check | Status |
