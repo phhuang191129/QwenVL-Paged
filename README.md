@@ -36,6 +36,10 @@ cache manager, or block-table semantics.
   page table token by token, so scattered blocks, grouped-query heads, and
   copy-on-write branches have a defined expected result for a future CUDA or
   Triton kernel to reproduce (`CacheLayout`, `CacheView`, `PagedAttention`).
+- **Triton GPU decode kernel**: a device backend that consumes only
+  `KVBlockLayout`'s four strides and the flattened block table, validated against
+  the same golden vectors as the CPU reference and benchmarked at the real
+  Qwen3-VL-2B block shape (`tools/triton_kernel/`).
 
 ## Architecture
 
@@ -78,7 +82,10 @@ tests/                  GoogleTest specification tests (one per module)
 bench/                  std::chrono latency harness for the allocator core
 tools/trace_gen/        Qwen3-VL trace generator (Python, processor geometry only)
 tools/trace_replay/     Trace replay driver + contiguous-reservation baseline
+tools/golden_export/    Golden fixture exporter and its pre-GPU verification gate
+tools/triton_kernel/    Triton decode kernel, fixture runner, and GPU benchmark
 traces/                 Generated request traces (JSONL)
+fixtures/               Golden attention vectors (.npz) shared by both backends
 results/                Measured CSV output backing docs/performance.md
 docs/architecture.md    Design document and phased roadmap
 docs/roadmap-phase2.md  Weeks 9-16: Qwen3-VL integration, profiling, optimization
@@ -95,6 +102,9 @@ CMakeLists.txt          Build and test configuration
 - For regenerating traces only: Python 3.12 and `transformers==4.57.1`. No model
   weights and no torch are needed. The committed traces under `traces/` mean this
   is not required to build, test, or reproduce the measured results.
+- For the GPU kernel only: an NVIDIA GPU plus a Python 3.12 environment with
+  torch and Triton, which `tools/triton_kernel/setup_gpu_box.sh` builds. Nothing
+  in the C++ build or test suite depends on it.
 
 ## Building
 
@@ -234,6 +244,62 @@ Headline results, with full context and caveats in
   finishes. Worst-case reservation is inefficient, but it is also a safety
   property.
 
+## GPU Kernel
+
+`tools/triton_kernel/` holds a Triton PagedAttention decode kernel. It consumes
+exactly what [`docs/architecture.md`](docs/architecture.md) promises an execution
+backend — `KVBlockLayout`'s four strides and the flattened
+`[num_seqs, max_blocks_per_seq]` block table — and nothing else, so that claim is
+tested rather than asserted.
+
+```bash
+# Build a pinned Python 3.12 venv, install torch/Triton, run the fixture gate.
+bash tools/triton_kernel/setup_gpu_box.sh
+
+# Validate against the same golden vectors the CPU reference produces.
+.venv/bin/python tools/triton_kernel/run_fixture.py fixtures
+
+# Block addressing past the int32 boundary, which the fixtures are too small to reach.
+.venv/bin/python tools/triton_kernel/check_large_pool.py
+
+# Benchmark at the real block shape; writes results/week15-gpu-kernel.csv.
+.venv/bin/python tools/triton_kernel/benchmark.py
+
+# Split-context kernel against that baseline; writes results/week16-context-partition.csv.
+cd tools/triton_kernel && ../../.venv/bin/python benchmark_partitioned.py \
+    ../../results/week16-context-partition.csv
+```
+
+The fixtures themselves come from `./build/qwenvl_golden_export fixtures`, packed
+by `tools/golden_export/pack_npz.py` and checked by
+`tools/golden_export/verify_fixtures.py`, which rebuilds attention from the
+strides and the block table alone.
+
+Measured on an NVIDIA L4, with full context and caveats in
+[`docs/performance.md`](docs/performance.md):
+
+- **The paging tax is below the measurement noise floor.** The same kernel over
+  consecutive versus randomly permuted frames differs by 0.01% at batch 32, while
+  a single layout varies 2.3% between its own fastest and slowest run.
+- **95% of peak DRAM bandwidth** at batch 32 with a 1,280-token image context,
+  measured with Nsight Compute. There is no bandwidth headroom left there.
+- **8-9% of peak at batch 1**, where 16 programs cannot fill 58 SMs. Profiling
+  shows DRAM utilization tracks achieved occupancy at a fixed ratio, so the lever
+  is partitioning the context across programs, not pipelining the inner loop.
+- **4.57x at batch 1** from doing exactly that: splitting each sequence's context
+  across programs and merging the partial softmaxes lifts occupancy from 8% to
+  58% and DRAM from 11% to 67%. The win decays with batch size and is gone by 16,
+  where the baseline already saturates memory, so the wrapper falls back to it.
+- **1.80x at batch 512** from renumbering the launch grid. The two query heads
+  sharing a KV head were `num_seqs` apart in launch order; past the point where
+  that exceeds what stays resident, the duplicated load stops hitting L2 and DRAM
+  traffic doubles. Making the query head the fast axis is a three-line fix, and it
+  buys what fusing the grouped-query heads would have, without halving the grid.
+
+The kernel reads a device pool supplied by the caller. Backing `MemoryAllocator`
+itself with CUDA memory, and exercising the synchronization rules an async
+backend must honor, are still to do.
+
 ## Usage
 
 The library exposes three cooperating objects. A minimal end-to-end setup looks
@@ -327,12 +393,17 @@ This is an early, actively developed prototype. The CPU allocator core,
 block-table virtual memory, copy-on-write, cache lifecycle, scheduler,
 swap/eviction interfaces, and a correctness-only reference PagedAttention path
 are implemented and covered by the module tests under `tests/`. The memory
-subsystem has been measured against real Qwen3-VL workload geometry
-([`docs/performance.md`](docs/performance.md)), but no model forward pass is
-wired up yet, so there are no latency or throughput numbers. GPU/Triton backends
-are still planned; the integration points and the synchronization rules they must
-honor are documented in [`docs/architecture.md`](docs/architecture.md), and the
-path from here is in [`docs/roadmap-phase2.md`](docs/roadmap-phase2.md).
+subsystem has been measured against real Qwen3-VL workload geometry, and a Triton
+decode kernel runs on GPU, validated against the CPU golden vectors and
+benchmarked at the real block shape
+([`docs/performance.md`](docs/performance.md)).
+
+No model forward pass is wired up yet, so there are no end-to-end latency or
+throughput numbers. On the GPU side the block pool is still supplied by the
+caller rather than by `MemoryAllocator`, the synchronization rules in
+[`docs/architecture.md`](docs/architecture.md) are documented but not yet
+exercised by a test, and the kernel has not been profiled. The path from here is
+in [`docs/roadmap-phase2.md`](docs/roadmap-phase2.md).
 
 ## License
 

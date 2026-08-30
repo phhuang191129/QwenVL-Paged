@@ -16,9 +16,15 @@ import time
 import numpy as np
 import torch
 
-from paged_attention_decode import paged_attention_decode_triton
+from paged_attention_decode import paged_attention_decode_partitioned, paged_attention_decode_triton
 
 TOLERANCE = 1e-3  # fp32 kernel vs. fp32 CPU reference; generous for softmax reordering.
+
+# Partition counts the split-context path is checked at. 2 and 3 straddle an
+# even and an uneven split of these fixtures' 1-3 logical blocks; 8 exceeds the
+# block count on every fixture, so it also covers partitions that hold no tokens
+# and must be weighted to zero by the merge rather than contributing a nan.
+PARTITION_COUNTS = (2, 3, 8)
 
 
 def run_one(path: pathlib.Path) -> bool:
@@ -56,6 +62,16 @@ def run_one(path: pathlib.Path) -> bool:
     max_diff = float(np.abs(actual - expected).max())
     ok = max_diff <= TOLERANCE
     print(f"{'pass' if ok else 'FAIL'}  {path.name}  max abs diff {max_diff:.3e}  {elapsed_us:.1f} us/call")
+
+    for num_partitions in PARTITION_COUNTS:
+        split = paged_attention_decode_partitioned(
+            kv_pool, block_table, context_lens, query, num_partitions=num_partitions, **kwargs
+        )
+        split_diff = float(np.abs(split.cpu().numpy() - expected).max())
+        split_ok = split_diff <= TOLERANCE
+        ok = ok and split_ok
+        print(f"{'  pass' if split_ok else '  FAIL'}    split x{num_partitions}  max abs diff {split_diff:.3e}")
+
     return ok
 
 

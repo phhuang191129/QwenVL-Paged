@@ -1,0 +1,19 @@
+# NVIDIA L4, 58 SMs, L2 48 MiB, peak DRAM 300 GB/s
+# block 16 tokens x 28 layers x 8 kv heads x 128 dim x 2 B, 16 query heads, bf16
+layout,batch,context_len,programs,kv_mib,fits_l2,us_per_call,unique_gb_per_s,pct_of_roof,step_ms
+consecutive,1,256,16,1,yes,45.17,23.22,7.7,1.265
+scattered,1,256,16,1,yes,45.46,23.07,7.7,1.273
+consecutive,8,256,128,8,yes,91.37,91.81,30.6,2.558
+scattered,8,256,128,8,yes,91.71,91.47,30.5,2.568
+consecutive,32,256,512,32,yes,192.58,174.23,58.1,5.392
+scattered,32,256,512,32,yes,193.28,173.60,57.9,5.412
+consecutive,64,256,1024,64,no,380.68,176.29,58.8,10.659
+scattered,64,256,1024,64,no,381.13,176.08,58.7,10.672
+consecutive,1,1280,16,5,yes,194.30,26.98,9.0,5.440
+scattered,1,1280,16,5,yes,195.03,26.88,9.0,5.461
+consecutive,8,1280,128,40,yes,334.78,125.28,41.8,9.374
+scattered,8,1280,128,40,yes,333.04,125.94,42.0,9.325
+consecutive,32,1280,512,160,no,819.90,204.62,68.2,22.957
+scattered,32,1280,512,160,no,825.23,203.30,67.8,23.106
+consecutive,64,1280,1024,320,no,1609.00,208.54,69.5,45.052
+scattered,64,1280,1024,320,no,1618.97,207.26,69.1,45.331
