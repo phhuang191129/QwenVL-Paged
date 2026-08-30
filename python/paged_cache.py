@@ -136,6 +136,9 @@ class PagedPool:
         self._dev_table = {}
         self._dev_context = {}
         self._cached_length = {}
+        self._table_len = {}
+        self._writable = None
+        self._scratch = {}
 
     def fork(self, parent_id, child_id):
         """Branches a sequence, sharing every one of its blocks until written."""
@@ -151,7 +154,9 @@ class PagedPool:
         for the blocks the table is actually missing is what makes this both
         correct and idempotent across the `num_layers` callers.
         """
-        have = len(self.block_table(sequence_id))
+        have = self._table_len.get(sequence_id)
+        if have is None:
+            have = len(self.block_table(sequence_id))
         need = -(-total_tokens // self.tokens_per_block)
         for _ in range(need - have):
             assert self.manager.reserve_tokens(sequence_id, self.tokens_per_block), (
@@ -159,7 +164,9 @@ class PagedPool:
             if self.scatter:
                 assert self.manager.reserve_tokens(self.spacer_id, self.tokens_per_block), (
                     "pool exhausted reserving a spacer frame; raise max_blocks")
+            have += 1
             self._invalidate_table(sequence_id)
+        self._table_len[sequence_id] = have
 
     def stream_base(self, layer_idx, stream):
         """Element offset of one layer's key or value slice within a frame."""
@@ -209,7 +216,16 @@ class PagedPool:
         return table[0, :count].to(torch.long)
 
     def writable_frame(self, sequence_id, token):
-        """Resolves a token's frame, honoring copy-on-write before any write."""
+        """Resolves a token's frame, honoring copy-on-write before any write.
+
+        Cached for the current token: all layers of a decode step write the
+        same position, and the first call is the one that materializes a
+        shared block.
+        """
+        hit = self._writable
+        if hit is not None and hit[0] == sequence_id and hit[1] == token:
+            return hit[2]
+
         frame = self.manager.ensure_token_writable(sequence_id, token)
         assert frame is not None, f"ensure_token_writable failed at token {token}"
         host = self._host_frames.get(sequence_id)
@@ -217,6 +233,7 @@ class PagedPool:
             logical = token // self.tokens_per_block
             if logical >= len(host) or host[logical] != frame:
                 self._invalidate_table(sequence_id)
+        self._writable = (sequence_id, token, frame)
         return frame
 
     def block_table(self, sequence_id):
@@ -304,6 +321,7 @@ class PagedLayer(CacheLayerMixin):
             tokens_per_block=self.pool.tokens_per_block,
             num_kv_heads=self.pool.num_kv_heads,
             scale=scale,
+            scratch=self.pool._scratch,
         )
         # Kernel emits [batch, heads, dim]; eager/sdpa emit [batch, q, heads, dim].
         return out.unsqueeze(1).contiguous()

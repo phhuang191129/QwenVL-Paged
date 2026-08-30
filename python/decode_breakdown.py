@@ -92,6 +92,7 @@ def instrument(buckets: Buckets):
             tokens_per_block=self.pool.tokens_per_block,
             num_kv_heads=self.pool.num_kv_heads,
             scale=scale,
+            scratch=self.pool._scratch,
         )
         torch.cuda.synchronize()
         buckets.add("launch", time.perf_counter() - started)

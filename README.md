@@ -362,9 +362,9 @@ gathers; decode writes the new token into its page and launches Triton. At this
 prompt the host path costs 51 ms/step over dense and the two device paths both
 cost ~11 ms/step — putting the kernel in the path did not move the number, so
 that 11 ms was write (~4 ms), rebuilding the block table every layer (~3 ms),
-and launch (~3 ms). Caching the table once per step dropped the middle bucket
-to 0.3 ms and the kernel path to +7.6 ms over dense. See
-`docs/performance.md` week 21.
+and launch (~3 ms). Caching the table, the current token's frame, and the kernel scratch dropped
+the kernel path to +3.9 ms over dense, now ahead of the gather. What remains
+is the per-layer write and two launches. See `docs/performance.md` week 21.
 
 ```bash
 PYTHONPATH=build .venv/bin/python python/decode_breakdown.py

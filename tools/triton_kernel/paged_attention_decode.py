@@ -321,6 +321,7 @@ def paged_attention_decode_partitioned(
     num_kv_heads: int,
     scale: float,
     num_partitions: int | None = None,
+    scratch: dict | None = None,
 ) -> torch.Tensor:
     """Decode attention with the context split across programs.
 
@@ -370,11 +371,36 @@ def paged_attention_decode_partitioned(
     partition_blocks = -(-max_blocks_per_seq // num_partitions)
     num_partitions = -(-max_blocks_per_seq // partition_blocks)
 
-    partial_out = torch.empty(
-        num_seqs, num_query_heads, num_partitions, head_dim, device=query.device, dtype=torch.float32
-    )
-    partial_max = torch.empty(num_seqs, num_query_heads, num_partitions, device=query.device, dtype=torch.float32)
-    partial_sum = torch.empty_like(partial_max)
+    # Reused across layers of a step: the shape is the same for every layer,
+    # and allocating three scratch tensors 28 times was part of the 120 us
+    # per-layer launch. Callers that do not pass `scratch` still allocate.
+    if scratch is None:
+        partial_out = torch.empty(
+            num_seqs, num_query_heads, num_partitions, head_dim,
+            device=query.device, dtype=torch.float32)
+        partial_max = torch.empty(
+            num_seqs, num_query_heads, num_partitions,
+            device=query.device, dtype=torch.float32)
+        partial_sum = torch.empty_like(partial_max)
+        out = torch.empty_like(query)
+    else:
+        key = (num_seqs, num_query_heads, num_partitions, head_dim, query.device, query.dtype)
+        bufs = scratch.get(key)
+        if bufs is None:
+            bufs = (
+                torch.empty(
+                    num_seqs, num_query_heads, num_partitions, head_dim,
+                    device=query.device, dtype=torch.float32),
+                torch.empty(
+                    num_seqs, num_query_heads, num_partitions,
+                    device=query.device, dtype=torch.float32),
+                torch.empty(
+                    num_seqs, num_query_heads, num_partitions,
+                    device=query.device, dtype=torch.float32),
+                torch.empty_like(query),
+            )
+            scratch[key] = bufs
+        partial_out, partial_max, partial_sum, out = bufs
 
     _paged_attention_partial_kernel[(num_query_heads, num_seqs, num_partitions)](
         kv_pool,
@@ -400,7 +426,6 @@ def paged_attention_decode_partitioned(
         TOKENS_PER_BLOCK=tokens_per_block,
     )
 
-    out = torch.empty_like(query)
     _paged_attention_reduce_kernel[(num_query_heads, num_seqs)](
         partial_out,
         partial_max,

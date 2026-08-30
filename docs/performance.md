@@ -1366,6 +1366,26 @@ The wall moved by the table bucket, not by hope. Write and launch did not.
 What remains is ~4 ms of `update()` and ~3.4 ms of per-layer launch; those
 are the two questions left, and they are now the same size.
 
+### Finding 4: reuse across layers cut write and launch, and the kernel finally beat the gather
+
+The same rule as the table: do not redo per layer what is identical for the
+step. `writable_frame` is cached for the current token, so 27 of 28 layers
+skip the pybind into `ensure_token_writable`. The partitioned wrapper keeps
+its scratch tensors on the pool, so 27 of 28 layers skip three allocations.
+
+| | Kernel after table cache | After reuse |
+| --- | ---: | ---: |
+| Write | 3.98 ms/step | 3.12 |
+| Table | 0.26 | 0.25 |
+| Launch | 3.41 | 2.56 |
+| Versus dense | +7.57 | **+3.92** |
+| Versus gather | gather was cheaper | kernel **+3.92** vs gather **+5.71** |
+
+Write is still 3.1 ms of real stores — permute and two slice writes, 28 times.
+Launch is still 90 µs/layer of two kernel launches. CUDA graphs would capture
+the second; they would not capture the first. The remaining 4 ms versus dense
+is those two, in that order.
+
 ### Verification status
 
 | Check | Status |
