@@ -59,6 +59,7 @@ set(qwenvl_spec_tests
     PagedAttention
     Scheduler
     SwapBackend
+    SynchronizationRules
 )
 foreach(spec IN LISTS qwenvl_spec_tests)
     add_executable(${spec}_test tests/${spec}.test.cpp)

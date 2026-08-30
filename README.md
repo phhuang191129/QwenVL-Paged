@@ -273,7 +273,11 @@ cd tools/triton_kernel && ../../.venv/bin/python benchmark_partitioned.py \
 The fixtures themselves come from `./build/qwenvl_golden_export fixtures`, packed
 by `tools/golden_export/pack_npz.py` and checked by
 `tools/golden_export/verify_fixtures.py`, which rebuilds attention from the
-strides and the block table alone.
+strides and the block table alone. Four of them fill a clean pool once;
+`cow_and_recycled_frames` instead drives the allocator through a fork, a
+copy-on-write of every one of the child's blocks, and a sequence built on frames
+recycled from a released one, so the kernel is validated against a pool that
+paging has actually churned rather than a static snapshot.
 
 Measured on an NVIDIA L4, with full context and caveats in
 [`docs/performance.md`](docs/performance.md):
@@ -296,9 +300,13 @@ Measured on an NVIDIA L4, with full context and caveats in
   traffic doubles. Making the query head the fast axis is a three-line fix, and it
   buys what fusing the grouped-query heads would have, without halving the grid.
 
-The kernel reads a device pool supplied by the caller. Backing `MemoryAllocator`
-itself with CUDA memory, and exercising the synchronization rules an async
-backend must honor, are still to do.
+The block pool is now a single contiguous slab with frame `i` at
+`i * block_stride_bytes()`, so a `PhysicalBlockId` is an offset rather than a
+handle to an independent allocation. That is what the kernel's
+`physical_id * elements_per_block` addressing needs, and it reduces a
+device-backed pool to one allocation site. The kernel still reads a device pool
+supplied by the caller: the layouts are proven compatible, but nothing has run
+against memory `MemoryAllocator` owns yet.
 
 ## Usage
 
@@ -400,10 +408,12 @@ benchmarked at the real block shape
 
 No model forward pass is wired up yet, so there are no end-to-end latency or
 throughput numbers. On the GPU side the block pool is still supplied by the
-caller rather than by `MemoryAllocator`, the synchronization rules in
-[`docs/architecture.md`](docs/architecture.md) are documented but not yet
-exercised by a test, and the kernel has not been profiled. The path from here is
-in [`docs/roadmap-phase2.md`](docs/roadmap-phase2.md).
+caller rather than allocated by `MemoryAllocator`, though the two now share a
+layout. Four of the six synchronization rules in
+[`docs/architecture.md`](docs/architecture.md) are exercised by
+`tests/SynchronizationRules.test.cpp`; the remaining two govern an asynchronous
+backend that does not exist yet and are named as untested rather than faked. The
+path from here is in [`docs/roadmap-phase2.md`](docs/roadmap-phase2.md).
 
 ## License
 

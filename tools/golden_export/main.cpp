@@ -260,6 +260,139 @@ bool is_scattered(const BlockTable& table) {
     return highest - lowest + 1 != entries.size();
 }
 
+/**
+ * @brief Runs the reference kernel over a populated cache and writes the .npy set.
+ *
+ * Everything from "the cache holds its contents" onward is independent of how it
+ * got that way, so both exporters share it. `sequences` gives the fixture's
+ * sequence ids in the order they should appear in the batch; their salts are
+ * their positions in that vector, which is what cross_check recomputes from.
+ */
+void write_fixture(
+    const Scenario& scenario,
+    const BlockShape& shape,
+    const KVBlockLayout& layout,
+    MemoryAllocator& allocator,
+    KVCacheManager& cache,
+    const std::vector<SequenceId>& sequences,
+    std::uint32_t pool_blocks,
+    std::uint32_t max_blocks_per_seq,
+    const fs::path& root) {
+    const std::size_t num_seqs = sequences.size();
+    const std::size_t query_elements =
+        static_cast<std::size_t>(scenario.num_query_heads) * shape.head_dim;
+    std::vector<float> queries(num_seqs * query_elements, 0.0F);
+    std::vector<float> outputs(num_seqs * query_elements, 0.0F);
+    std::vector<std::int32_t> block_table(num_seqs * max_blocks_per_seq, -1);
+    std::vector<std::int32_t> context_lens(num_seqs, 0);
+
+    for (std::size_t i = 0; i < num_seqs; ++i) {
+        const std::uint32_t salt = static_cast<std::uint32_t>(i);
+        float* query = queries.data() + i * query_elements;
+        for (std::uint32_t query_head = 0; query_head < scenario.num_query_heads; ++query_head) {
+            for (std::uint32_t dim = 0; dim < shape.head_dim; ++dim) {
+                query[static_cast<std::size_t>(query_head) * shape.head_dim + dim] =
+                    query_value(salt, query_head, dim);
+            }
+        }
+
+        const std::optional<CacheView> view = cache.cache_view(sequences[i]);
+        require(view.has_value(), "cache_view failed");
+        if (scenario.scatter) {
+            require(
+                is_scattered(*view->block_table),
+                scenario.name + ": sequence " + std::to_string(i) + " did not scatter");
+        }
+
+        PagedAttentionParams params;
+        params.layer = scenario.layer;
+        params.num_query_heads = scenario.num_query_heads;
+        params.context_len = scenario.context_lens[i];
+        params.scale = scenario.scale;
+
+        float* out = outputs.data() + i * query_elements;
+        require(
+            paged_attention_decode<float>(*view, query, params, out),
+            "paged_attention_decode rejected the fixture");
+        cross_check(scenario, shape, salt, query, out);
+
+        const std::vector<BlockTableEntry>& entries = view->block_table->entries();
+        for (std::size_t j = 0; j < entries.size(); ++j) {
+            block_table[i * max_blocks_per_seq + j] =
+                static_cast<std::int32_t>(entries[j].physical_id);
+        }
+        context_lens[i] = static_cast<std::int32_t>(scenario.context_lens[i]);
+    }
+
+    const std::size_t elements_per_block = layout.element_count();
+    std::vector<float> pool(pool_blocks * elements_per_block, 0.0F);
+    for (PhysicalBlockId id = 0; id < pool_blocks; ++id) {
+        const PhysicalBlock* block = allocator.block(id);
+        std::memcpy(
+            pool.data() + static_cast<std::size_t>(id) * elements_per_block,
+            block->data(),
+            elements_per_block * sizeof(float));
+    }
+
+    const fs::path dir = root / scenario.name;
+    fs::create_directories(dir);
+
+    write_f32(dir, "kv_pool", {pool_blocks, elements_per_block}, pool);
+    write_f32(dir, "query", {num_seqs, scenario.num_query_heads, shape.head_dim}, queries);
+    write_f32(dir, "output", {num_seqs, scenario.num_query_heads, shape.head_dim}, outputs);
+    write_i32(dir, "block_table", {num_seqs, max_blocks_per_seq}, block_table);
+    write_i32(dir, "context_lens", {num_seqs}, context_lens);
+
+    write_scalar_i32(dir, "tokens_per_block", shape.tokens_per_block);
+    write_scalar_i32(dir, "num_layers", shape.num_layers);
+    write_scalar_i32(dir, "num_kv_heads", shape.num_kv_heads);
+    write_scalar_i32(dir, "head_dim", shape.head_dim);
+    write_scalar_i32(dir, "num_query_heads", scenario.num_query_heads);
+    write_scalar_i32(dir, "layer", scenario.layer);
+    write_scalar_i32(dir, "head_stride", static_cast<std::int64_t>(layout.head_stride()));
+    write_scalar_i32(dir, "token_stride", static_cast<std::int64_t>(layout.token_stride()));
+    write_scalar_i32(dir, "stream_stride", static_cast<std::int64_t>(layout.stream_stride()));
+    write_scalar_i32(dir, "layer_stride", static_cast<std::int64_t>(layout.layer_stride()));
+    write_scalar_f32(dir, "scale", scenario.scale);
+
+    std::cout << scenario.name << ": " << num_seqs << " seq, pool " << pool_blocks << " blocks, "
+              << (pool.size() * sizeof(float)) / 1024 << " KiB  -- " << scenario.purpose << "\n";
+}
+
+/**
+ * @brief Writes one sequence's whole context into the cache, honoring copy-on-write.
+ */
+void fill_sequence(
+    const BlockShape& shape,
+    const KVBlockLayout& layout,
+    MemoryAllocator& allocator,
+    KVCacheManager& cache,
+    SequenceId sequence,
+    std::uint32_t salt,
+    std::uint32_t context_len) {
+    for (std::uint32_t layer = 0; layer < shape.num_layers; ++layer) {
+        for (const KVStream stream : {KVStream::Key, KVStream::Value}) {
+            for (std::uint32_t token = 0; token < context_len; ++token) {
+                const std::optional<PhysicalBlockId> physical =
+                    cache.ensure_token_writable(sequence, token);
+                require(physical.has_value(), "ensure_token_writable failed");
+                PhysicalBlock* block = allocator.block(*physical);
+                require(block != nullptr, "writable frame missing");
+                float* base = reinterpret_cast<float*>(block->data());
+
+                for (std::uint32_t head = 0; head < shape.num_kv_heads; ++head) {
+                    const std::optional<std::size_t> offset = layout.element_offset(
+                        layer, stream, token % shape.tokens_per_block, head);
+                    require(offset.has_value(), "element_offset out of range");
+                    for (std::uint32_t dim = 0; dim < shape.head_dim; ++dim) {
+                        base[*offset + dim] = cache_value(salt, layer, stream, token, head, dim);
+                    }
+                }
+            }
+        }
+    }
+}
+
 void export_scenario(const Scenario& scenario, const fs::path& root) {
     BlockShape shape;
     shape.tokens_per_block = scenario.tokens_per_block;
@@ -338,109 +471,163 @@ void export_scenario(const Scenario& scenario, const fs::path& root) {
         cache.release_sequence(kSpacerSequence);
     }
 
+    std::vector<SequenceId> sequences(num_seqs);
     for (std::size_t i = 0; i < num_seqs; ++i) {
-        const std::uint32_t salt = static_cast<std::uint32_t>(i);
-        for (std::uint32_t layer = 0; layer < shape.num_layers; ++layer) {
-            for (const KVStream stream : {KVStream::Key, KVStream::Value}) {
-                for (std::uint32_t token = 0; token < scenario.context_lens[i]; ++token) {
-                    const std::optional<PhysicalBlockId> physical =
-                        cache.ensure_token_writable(sequence_id(i), token);
-                    require(physical.has_value(), "ensure_token_writable failed");
-                    PhysicalBlock* block = allocator.block(*physical);
-                    require(block != nullptr, "writable frame missing");
-                    float* base = reinterpret_cast<float*>(block->data());
+        sequences[i] = sequence_id(i);
+        fill_sequence(
+            shape, layout, allocator, cache, sequences[i], static_cast<std::uint32_t>(i),
+            scenario.context_lens[i]);
+    }
 
-                    for (std::uint32_t head = 0; head < shape.num_kv_heads; ++head) {
-                        const std::optional<std::size_t> offset = layout.element_offset(
-                            layer, stream, token % shape.tokens_per_block, head);
-                        require(offset.has_value(), "element_offset out of range");
-                        for (std::uint32_t dim = 0; dim < shape.head_dim; ++dim) {
-                            base[*offset + dim] = cache_value(salt, layer, stream, token, head, dim);
-                        }
-                    }
-                }
-            }
+    write_fixture(
+        scenario, shape, layout, allocator, cache, sequences, pool_blocks, max_blocks_per_seq, root);
+}
+
+/**
+ * @brief Returns the physical frames a sequence currently maps, in logical order.
+ */
+std::vector<PhysicalBlockId> mapped_frames(KVCacheManager& cache, SequenceId sequence) {
+    const std::optional<CacheView> view = cache.cache_view(sequence);
+    require(view.has_value(), "cache_view failed");
+
+    std::vector<PhysicalBlockId> frames;
+    for (const BlockTableEntry& entry : view->block_table->entries()) {
+        frames.push_back(entry.physical_id);
+    }
+    return frames;
+}
+
+/**
+ * @brief Exports a fixture whose pool state is the product of allocator churn.
+ *
+ * Every other scenario fills a freshly zeroed pool exactly once, so all four
+ * validate the kernel against cache contents that no fork, copy-on-write, or
+ * frame recycle ever touched. That leaves the half of a paged allocator worth
+ * having unchecked. A fixture built by a clean fill still passes if a fork
+ * corrupts its parent, if copy-on-write leaves a block table pointing at the
+ * pre-copy frame, or if a recycled frame's stale bytes leak past the context
+ * length of a partially filled block.
+ *
+ * Three sequences go into the batch:
+ *
+ *   0  the fork parent, which must still read its own contents after the child
+ *      has written over what it thought it shared
+ *   1  the child, every one of whose blocks was materialized by copy-on-write
+ *   2  a sequence built on frames recycled from a released one, ending mid-block
+ *      so the tail of its last frame still holds the dead sequence's KV
+ *
+ * The pool is prefilled with a deterministic non-zero pattern instead of being
+ * zeroed. Stale data the kernel must never read is then real data rather than
+ * zeros, which a masking bug could hide behind: summing exp(q.0)*0 over a
+ * zeroed tail perturbs only the softmax denominator, while a garbage tail moves
+ * the output somewhere unmistakable.
+ */
+void export_churn_scenario(const fs::path& root) {
+    const Scenario scenario{
+        "cow_and_recycled_frames",
+        "a fork parent, its copy-on-write child, and a sequence on recycled frames",
+        4, 2, 2, 8, 4, 1, 0.35F, {10, 10, 6}, false};
+
+    BlockShape shape;
+    shape.tokens_per_block = scenario.tokens_per_block;
+    shape.num_layers = scenario.num_layers;
+    shape.num_kv_heads = scenario.num_kv_heads;
+    shape.head_dim = scenario.head_dim;
+    shape.bytes_per_element = static_cast<std::uint32_t>(sizeof(float));
+
+    KVBlockLayout layout;
+    layout.shape = shape;
+
+    // Peak demand is parent 3 + child 3 + recycled 2; the victim's three frames
+    // are back on the free list before any of those are claimed. The spare two
+    // are never allocated, so they keep the prefill pattern and a kernel that
+    // wanders out of its block table lands in obvious garbage.
+    constexpr std::uint32_t kPoolBlocks = 10;
+    constexpr std::uint32_t kMaxBlocksPerSeq = 3;
+
+    // Distinct from every exported sequence's salt, so the victim's leftovers
+    // can never be mistaken for a correct read.
+    constexpr std::uint32_t kVictimSalt = 7;
+
+    constexpr SequenceId kVictim = 100;
+    constexpr SequenceId kParent = 1;
+    constexpr SequenceId kChild = 2;
+    constexpr SequenceId kRecycled = 3;
+
+    AllocatorConfig config;
+    config.block_shape = shape;
+    config.max_blocks = kPoolBlocks;
+    MemoryAllocator allocator(config);
+    KVCacheManager cache(allocator);
+
+    for (PhysicalBlockId id = 0; id < kPoolBlocks; ++id) {
+        PhysicalBlock* block = allocator.block(id);
+        require(block != nullptr, "pool frame missing");
+        float* base = reinterpret_cast<float*>(block->data());
+        const std::size_t count = block->size_bytes() / sizeof(float);
+        for (std::size_t i = 0; i < count; ++i) {
+            base[i] = mix({2U, id, static_cast<std::uint32_t>(i)});
         }
     }
 
-    const std::size_t query_elements =
-        static_cast<std::size_t>(scenario.num_query_heads) * shape.head_dim;
-    std::vector<float> queries(num_seqs * query_elements, 0.0F);
-    std::vector<float> outputs(num_seqs * query_elements, 0.0F);
-    std::vector<std::int32_t> block_table(num_seqs * max_blocks_per_seq, -1);
-    std::vector<std::int32_t> context_lens(num_seqs, 0);
+    require(
+        cache.create_sequence(SequenceMetadata{kParent, kParent, {}, {}}), "create parent failed");
+    require(cache.reserve_tokens(kParent, scenario.context_lens[0]), "reserve parent failed");
+    fill_sequence(shape, layout, allocator, cache, kParent, 0, scenario.context_lens[0]);
 
-    for (std::size_t i = 0; i < num_seqs; ++i) {
-        const std::uint32_t salt = static_cast<std::uint32_t>(i);
-        float* query = queries.data() + i * query_elements;
-        for (std::uint32_t query_head = 0; query_head < scenario.num_query_heads; ++query_head) {
-            for (std::uint32_t dim = 0; dim < shape.head_dim; ++dim) {
-                query[static_cast<std::size_t>(query_head) * shape.head_dim + dim] =
-                    query_value(salt, query_head, dim);
-            }
-        }
+    require(
+        cache.fork_sequence(kParent, SequenceMetadata{kChild, kChild, {}, {}}),
+        "fork_sequence failed");
 
-        const std::optional<CacheView> view = cache.cache_view(sequence_id(i));
-        require(view.has_value(), "cache_view failed");
-        if (scenario.scatter) {
-            require(
-                is_scattered(*view->block_table),
-                scenario.name + ": sequence " + std::to_string(i) + " did not scatter");
-        }
+    // The child shares every one of the parent's blocks right now, so each first
+    // touch below has to materialize a private copy.
+    fill_sequence(shape, layout, allocator, cache, kChild, 1, scenario.context_lens[1]);
 
-        PagedAttentionParams params;
-        params.layer = scenario.layer;
-        params.num_query_heads = scenario.num_query_heads;
-        params.context_len = scenario.context_lens[i];
-        params.scale = scenario.scale;
+    // A sequence that lives just long enough to dirty three frames and hand them
+    // back. The free list is LIFO, so this has to happen immediately before the
+    // recycled sequence allocates or some earlier sequence takes the frames
+    // instead -- which is what the reuse check below caught the first time.
+    require(
+        cache.create_sequence(SequenceMetadata{kVictim, kVictim, {}, {}}), "create victim failed");
+    require(cache.reserve_tokens(kVictim, scenario.context_lens[0]), "reserve victim failed");
+    fill_sequence(shape, layout, allocator, cache, kVictim, kVictimSalt, scenario.context_lens[0]);
+    const std::vector<PhysicalBlockId> victim_frames = mapped_frames(cache, kVictim);
+    cache.release_sequence(kVictim);
 
-        float* out = outputs.data() + i * query_elements;
+    require(
+        cache.create_sequence(SequenceMetadata{kRecycled, kRecycled, {}, {}}),
+        "create recycled failed");
+    require(cache.reserve_tokens(kRecycled, scenario.context_lens[2]), "reserve recycled failed");
+    fill_sequence(shape, layout, allocator, cache, kRecycled, 2, scenario.context_lens[2]);
+
+    // Guard the fixture's premises. Without these the scenario could quietly
+    // decay into three ordinary sequences and still pass, pinning down a weaker
+    // property than its name claims.
+    const std::vector<PhysicalBlockId> parent_frames = mapped_frames(cache, kParent);
+    const std::vector<PhysicalBlockId> child_frames = mapped_frames(cache, kChild);
+    const std::vector<PhysicalBlockId> recycled_frames = mapped_frames(cache, kRecycled);
+
+    for (const PhysicalBlockId frame : child_frames) {
         require(
-            paged_attention_decode<float>(*view, query, params, out),
-            "paged_attention_decode rejected the fixture");
-        cross_check(scenario, shape, salt, query, out);
-
-        const std::vector<BlockTableEntry>& entries = view->block_table->entries();
-        for (std::size_t j = 0; j < entries.size(); ++j) {
-            block_table[i * max_blocks_per_seq + j] =
-                static_cast<std::int32_t>(entries[j].physical_id);
-        }
-        context_lens[i] = static_cast<std::int32_t>(scenario.context_lens[i]);
+            std::find(parent_frames.begin(), parent_frames.end(), frame) == parent_frames.end(),
+            "child still shares a frame with its parent: copy-on-write did not happen");
     }
+    require(
+        std::any_of(
+            recycled_frames.begin(),
+            recycled_frames.end(),
+            [&victim_frames](PhysicalBlockId frame) {
+                return std::find(victim_frames.begin(), victim_frames.end(), frame) !=
+                       victim_frames.end();
+            }),
+        "recycled sequence drew only fresh frames: the fixture is not testing reuse");
+    require(
+        scenario.context_lens[2] % scenario.tokens_per_block != 0,
+        "recycled sequence must end mid-block to leave a stale tail exposed");
 
-    const std::size_t elements_per_block = layout.element_count();
-    std::vector<float> pool(pool_blocks * elements_per_block, 0.0F);
-    for (PhysicalBlockId id = 0; id < pool_blocks; ++id) {
-        const PhysicalBlock* block = allocator.block(id);
-        std::memcpy(
-            pool.data() + static_cast<std::size_t>(id) * elements_per_block,
-            block->data(),
-            elements_per_block * sizeof(float));
-    }
-
-    const fs::path dir = root / scenario.name;
-    fs::create_directories(dir);
-
-    write_f32(dir, "kv_pool", {pool_blocks, elements_per_block}, pool);
-    write_f32(dir, "query", {num_seqs, scenario.num_query_heads, shape.head_dim}, queries);
-    write_f32(dir, "output", {num_seqs, scenario.num_query_heads, shape.head_dim}, outputs);
-    write_i32(dir, "block_table", {num_seqs, max_blocks_per_seq}, block_table);
-    write_i32(dir, "context_lens", {num_seqs}, context_lens);
-
-    write_scalar_i32(dir, "tokens_per_block", shape.tokens_per_block);
-    write_scalar_i32(dir, "num_layers", shape.num_layers);
-    write_scalar_i32(dir, "num_kv_heads", shape.num_kv_heads);
-    write_scalar_i32(dir, "head_dim", shape.head_dim);
-    write_scalar_i32(dir, "num_query_heads", scenario.num_query_heads);
-    write_scalar_i32(dir, "layer", scenario.layer);
-    write_scalar_i32(dir, "head_stride", static_cast<std::int64_t>(layout.head_stride()));
-    write_scalar_i32(dir, "token_stride", static_cast<std::int64_t>(layout.token_stride()));
-    write_scalar_i32(dir, "stream_stride", static_cast<std::int64_t>(layout.stream_stride()));
-    write_scalar_i32(dir, "layer_stride", static_cast<std::int64_t>(layout.layer_stride()));
-    write_scalar_f32(dir, "scale", scenario.scale);
-
-    std::cout << scenario.name << ": " << num_seqs << " seq, pool " << pool_blocks << " blocks, "
-              << (pool.size() * sizeof(float)) / 1024 << " KiB  -- " << scenario.purpose << "\n";
+    write_fixture(
+        scenario, shape, layout, allocator, cache, {kParent, kChild, kRecycled}, kPoolBlocks,
+        kMaxBlocksPerSeq, root);
 }
 
 std::vector<Scenario> scenarios() {
@@ -476,6 +663,7 @@ int main(int argc, char** argv) {
         for (const qwenvl_paged::Scenario& scenario : qwenvl_paged::scenarios()) {
             qwenvl_paged::export_scenario(scenario, root);
         }
+        qwenvl_paged::export_churn_scenario(root);
     } catch (const std::exception& error) {
         std::cerr << "golden_export failed: " << error.what() << "\n";
         return 1;
