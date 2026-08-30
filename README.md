@@ -354,6 +354,17 @@ PYTHONPATH=build .venv/bin/python python/token_identical_check.py
 PYTHONPATH=build .venv/bin/python python/qwen3vl_2b_check.py
 ```
 
+`python/fork_sharing_check.py` covers the property paging exists for. Four
+continuations are sampled from one image prompt, each seeded with a different
+top-4 token so they genuinely diverge, and each must match what its seed produces
+against a private `DynamicCache`. The four share all 78 prompt blocks and
+privately own two each — the tail block copy-on-write duplicates, plus one block
+of growth — so they hold 150 MiB where four dense caches hold 552 MiB.
+
+```bash
+PYTHONPATH=build .venv/bin/python python/fork_sharing_check.py
+```
+
 This validates the memory subsystem against a real model; it does not run the
 Triton kernel. `update()` must return contiguous K/V for torch attention, so
 every step gathers the context out of its blocks — 137 MiB per step at that
@@ -459,7 +470,8 @@ benchmarked at the real block shape
 ([`docs/performance.md`](docs/performance.md)).
 
 Qwen3-VL-2B-Instruct now runs on the paged cache and is token-identical to
-transformers' `DynamicCache`, image prompt included. That path uses torch
+transformers' `DynamicCache`, image prompt included, and four sampling branches
+of one prompt hold 3.67x less KV than four dense caches. That path uses torch
 attention over gathered blocks rather than the Triton kernel, so there are still
 no end-to-end latency or throughput numbers. The kernel does
 read a pool the allocator manages through the pybind11 module under `python/`,

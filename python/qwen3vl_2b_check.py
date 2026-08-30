@@ -119,7 +119,7 @@ def main() -> int:
     actual = generate(model, inputs, paged)
     paged_seconds = time.perf_counter() - started
 
-    frames = pool.block_table()
+    frames = pool.block_table(pool.root_id)
     gathered = sum(layer.gathered_elements for layer in paged.layers) * DTYPE.itemsize
 
     expected_new = expected[0, prompt_tokens:].tolist()

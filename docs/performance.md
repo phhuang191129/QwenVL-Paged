@@ -948,11 +948,13 @@ The half it does not close is the kernel, which finding 4 covers: this path uses
 torch attention over gathered blocks, so nothing here is an end-to-end
 performance result.
 
-Two gates, the first for every change and the second before believing it:
+Three gates: the first for every change, the second before believing it, the
+third for the property paging exists for.
 
 ```bash
 PYTHONPATH=build .venv/bin/python python/token_identical_check.py   # ~4 s
 PYTHONPATH=build .venv/bin/python python/qwen3vl_2b_check.py        # ~10 s
+PYTHONPATH=build .venv/bin/python python/fork_sharing_check.py      # ~20 s
 ```
 
 ### Finding 1: the integration point moved, and the roadmap's design is stale
@@ -1071,6 +1073,55 @@ it — the pool being bytes is also what C++ already believes. And the gather
 concatenates on the host before crossing to the device, so the context makes one
 transfer per stream per layer rather than one per block.
 
+### Finding 6: four branches of a 1,242-token prompt cost 1.09 prompts, not 4
+
+This is the case paging exists for, and the one the roadmap asks to have
+measured. Sampling four continuations from one image prompt means four copies of
+its KV in a dense cache. With block tables and copy-on-write the branches share
+every prompt block and privately own only what they write.
+
+```bash
+PYTHONPATH=build .venv/bin/python python/fork_sharing_check.py
+```
+
+| Quantity | Paged | Four `DynamicCache`s |
+| --- | --- | --- |
+| KV held after 4 x 20 tokens | 150 MiB | 552 MiB |
+| Frames in use | 86 | equivalent of 316 |
+| | 77 shared, 9 owned outright | none shared |
+
+3.67x less memory for the same four continuations. The frame accounting is
+exactly what the design predicts and is asserted rather than eyeballed: 78 prompt
+blocks shared by everyone, then two private blocks per branch — the partially
+filled tail block, which copy-on-write duplicates the moment a branch writes its
+first token into it, plus the one block each branch grows into. Nothing else is
+copied, and the parent's block table is unchanged at the end.
+
+The branches have to actually diverge or the test proves nothing, so each is
+seeded with a different one of the top-4 next tokens:
+
+```
+branch 0: 'A vibrant, pixelated gradient that smoothly transitions through the full'
+branch 1: 'This is a digital gradient image composed of a smooth transition of'
+branch 2: 'The image displays a smooth, continuous gradient of colors that transitions'
+branch 3: 'An abstract, pixelated gradient that transitions smoothly from deep blue'
+```
+
+Each is separately required to match what the same seed produces against a
+private `DynamicCache`, so the sharing is not just cheap but correct.
+
+The saving grows with prompt length and branch count, because the shared part is
+the prompt and the private part is a constant two blocks per branch. It is also
+a lower bound on what matters at serving scale, where the shared prefix is
+commonly a system prompt across unrelated requests rather than one prompt across
+its own samples.
+
+One counter is easy to misread and worth naming: `AllocatorStats::active_blocks`
+does not mean "frames in use". Active is a frame exactly one sequence holds and
+Shared is one that several do, so a frame every branch reads is in the second
+bucket. Frames in use is the sum, and reading the first alone reports 9 here
+instead of 86.
+
 ### Verification status
 
 | Check | Status |
@@ -1083,14 +1134,22 @@ transfer per stream per layer rather than one per block.
 | Gate fails when the gather ignores the block table | pass, diverges at token 2 |
 | Real Qwen3-VL-2B, bf16, 1,225 image tokens: token-identical | pass, 20 steps |
 | Real model: gate fails when the gather ignores the block table | pass, diverges at token 0 |
+| Four branches share the whole prompt at fork time | pass |
+| Four branches diverge, and each matches its own `DynamicCache` run | pass |
+| Parent's blocks survive the branches' writes | pass |
+| Frame accounting after forking | pass, 86 as predicted |
 | Week 17 checks still pass | pass, 153 tests, live pool check, 20 fixture checks |
 
 ### Known limitations of these numbers
 
-- **Batch size 1, greedy, single sequence.** All three are asserted rather than
-  handled. In particular there is no fork in either gate, so prompt sharing
-  across sampling branches — the thing paging exists to make cheap — is still
-  unmeasured, and the RSS comparison the roadmap asks for has not been run.
+- **Batch size 1 and greedy, per sequence.** Branches share a pool but are
+  stepped one at a time rather than batched, and beam reordering is refused
+  outright. Nothing here measures what batching the branches would cost or save.
+- **Memory is compared as KV bytes held, not RSS.** The roadmap asks for an RSS
+  delta, but the dense caches live in device memory while the paged pool is host
+  memory, so process RSS would not compare them. Bytes of KV resident is the
+  like-for-like counter; it is also the one that stays meaningful once the pool
+  moves to the device.
 - **The gather is the path, not the kernel.** No number in this section reflects
   the Triton kernel, because the Triton kernel does not run in it. The 35 ms per
   step is the cost of *not* having it in the path.

@@ -88,7 +88,7 @@ def main() -> int:
     actual, actual_logits = greedy(model, prompt, paged)
     paged_seconds = time.perf_counter() - started
 
-    frames = pool.block_table()
+    frames = pool.block_table(pool.root_id)
     total_tokens = PROMPT_TOKENS + NEW_TOKENS
     expected_frames = -(-total_tokens // pool.tokens_per_block)
     gathered = sum(layer.gathered_elements for layer in paged.layers)
