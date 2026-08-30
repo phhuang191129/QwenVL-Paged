@@ -15,6 +15,8 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <optional>
 #include <vector>
 
@@ -42,6 +44,83 @@ TEST(MemoryAllocatorTest, ConstructsWithValidConfig) {
     EXPECT_EQ(stats.total_blocks, 4u);
     EXPECT_EQ(stats.free_blocks, 4u);
     EXPECT_EQ(stats.active_blocks, 0u);
+}
+
+TEST(MemoryAllocatorTest, PoolIsOneSlabAddressableByBlockId) {
+    // The invariant an execution backend depends on: a PhysicalBlockId is an
+    // offset into one allocation, so a device mirror can be produced by copying
+    // the slab and indexed by the same ids. The Triton decode kernel resolves a
+    // block as physical_id * elements_per_block with no pointer table, which is
+    // only correct if this holds.
+    constexpr std::uint32_t kBlockCount = 64;
+    MemoryAllocator allocator(make_test_config(kBlockCount));
+
+    ASSERT_NE(allocator.pool_base(), nullptr);
+    EXPECT_EQ(allocator.pool_bytes(), allocator.block_stride_bytes() * kBlockCount);
+
+    for (std::uint32_t id = 0; id < kBlockCount; ++id) {
+        const PhysicalBlock* frame = allocator.block(id);
+        ASSERT_NE(frame, nullptr);
+        EXPECT_EQ(frame->data(), allocator.pool_base() + id * allocator.block_stride_bytes());
+        EXPECT_EQ(frame->size_bytes(), allocator.block_stride_bytes());
+    }
+}
+
+TEST(MemoryAllocatorTest, FramesDoNotOverlap) {
+    constexpr std::uint32_t kBlockCount = 8;
+    MemoryAllocator allocator(make_test_config(kBlockCount));
+
+    // Stamp each frame with its own id, then read every frame back. Any stride
+    // smaller than a frame would have let a later write bleed into an earlier
+    // frame's bytes.
+    for (std::uint32_t id = 0; id < kBlockCount; ++id) {
+        PhysicalBlock* frame = allocator.block(id);
+        ASSERT_NE(frame, nullptr);
+        std::memset(frame->data(), static_cast<int>(id), frame->size_bytes());
+    }
+
+    for (std::uint32_t id = 0; id < kBlockCount; ++id) {
+        const PhysicalBlock* frame = allocator.block(id);
+        ASSERT_NE(frame, nullptr);
+        for (std::size_t i = 0; i < frame->size_bytes(); ++i) {
+            ASSERT_EQ(frame->data()[i], static_cast<std::byte>(id)) << "frame " << id << " byte " << i;
+        }
+    }
+}
+
+TEST(MemoryAllocatorTest, EveryFrameSatisfiesRequestedAlignment) {
+    // A single frame can be aligned by luck even from an allocator that ignores
+    // alignment, so checking the whole pool makes an unaligned implementation
+    // fail with near-certainty rather than by chance.
+    constexpr std::uint32_t kBlockCount = 64;
+    AllocatorConfig config = make_test_config(kBlockCount);
+    config.memory_options.alignment_bytes = kDefaultBlockAlignmentBytes;
+    MemoryAllocator allocator(config);
+
+    EXPECT_EQ(allocator.alignment_bytes(), kDefaultBlockAlignmentBytes);
+
+    for (std::uint32_t id = 0; id < kBlockCount; ++id) {
+        const PhysicalBlock* frame = allocator.block(id);
+        ASSERT_NE(frame, nullptr);
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(frame->data()) % kDefaultBlockAlignmentBytes, 0u);
+    }
+}
+
+TEST(MemoryAllocatorTest, BlockStrideCoversShapeAndIsAlignmentRounded) {
+    AllocatorConfig config = make_test_config();
+    config.memory_options.alignment_bytes = kDefaultBlockAlignmentBytes;
+    MemoryAllocator allocator(config);
+
+    EXPECT_GE(allocator.block_stride_bytes(), config.block_shape.byte_size());
+    EXPECT_EQ(allocator.block_stride_bytes() % kDefaultBlockAlignmentBytes, 0u);
+}
+
+TEST(MemoryAllocatorTest, PinnedMemoryRequestIsReported) {
+    AllocatorConfig config = make_test_config();
+    config.memory_options.prefer_pinned_memory = true;
+    MemoryAllocator allocator(config);
+
+    EXPECT_TRUE(allocator.pinned_memory_requested());
 }
 
 TEST(MemoryAllocatorTest, AllocateReturnsDistinctIdsUntilExhausted) {

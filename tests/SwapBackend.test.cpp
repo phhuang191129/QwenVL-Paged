@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <vector>
 
 namespace qwenvl_paged {
 namespace {
@@ -30,6 +31,26 @@ BlockShape make_block_shape() {
     shape.bytes_per_element = 4;
     return shape;
 }
+
+/**
+ * @brief A frame that carries its own storage, for testing the backend alone.
+ *
+ * A PhysicalBlock is a view into the slab MemoryAllocator owns. These tests
+ * deliberately run without an allocator, so they have to supply the bytes
+ * themselves; converting on use keeps that out of every call site.
+ */
+class TestFrame {
+public:
+    TestFrame(PhysicalBlockId id, BlockShape shape)
+        : storage_(shape.byte_size()), block_(id, shape, storage_.data(), storage_.size()) {}
+
+    operator PhysicalBlock&() noexcept { return block_; }
+    operator const PhysicalBlock&() const noexcept { return block_; }
+
+private:
+    std::vector<std::byte> storage_;
+    PhysicalBlock block_;
+};
 
 /**
  * @brief Fills a block with a deterministic, seed-dependent byte pattern.
@@ -64,7 +85,7 @@ TEST(HostSwapBackendTest, StartsEmptyWithRequestedCapacity) {
 
 TEST(HostSwapBackendTest, StoreReturnsSlotAndTracksResidency) {
     HostSwapBackend backend(4);
-    PhysicalBlock block(0, make_block_shape());
+    TestFrame block(0, make_block_shape());
     fill_block(block, 1);
 
     const std::optional<SwapSlotId> slot = backend.store(block);
@@ -75,8 +96,8 @@ TEST(HostSwapBackendTest, StoreReturnsSlotAndTracksResidency) {
 
 TEST(HostSwapBackendTest, StoreGivesDistinctSlotsToResidentBlocks) {
     HostSwapBackend backend(4);
-    PhysicalBlock first(0, make_block_shape());
-    PhysicalBlock second(1, make_block_shape());
+    TestFrame first(0, make_block_shape());
+    TestFrame second(1, make_block_shape());
 
     const std::optional<SwapSlotId> first_slot = backend.store(first);
     const std::optional<SwapSlotId> second_slot = backend.store(second);
@@ -89,8 +110,8 @@ TEST(HostSwapBackendTest, StoreGivesDistinctSlotsToResidentBlocks) {
 
 TEST(HostSwapBackendTest, LoadRestoresStoredBytesIntoAnotherBlock) {
     HostSwapBackend backend(4);
-    PhysicalBlock source(0, make_block_shape());
-    PhysicalBlock destination(1, make_block_shape());
+    TestFrame source(0, make_block_shape());
+    TestFrame destination(1, make_block_shape());
     fill_block(source, 7);
     fill_block(destination, 200);
     ASSERT_FALSE(have_equal_bytes(source, destination));
@@ -104,8 +125,8 @@ TEST(HostSwapBackendTest, LoadRestoresStoredBytesIntoAnotherBlock) {
 
 TEST(HostSwapBackendTest, LoadKeepsSlotResidentSoItCanBeRetried) {
     HostSwapBackend backend(4);
-    PhysicalBlock source(0, make_block_shape());
-    PhysicalBlock destination(1, make_block_shape());
+    TestFrame source(0, make_block_shape());
+    TestFrame destination(1, make_block_shape());
     fill_block(source, 3);
 
     const std::optional<SwapSlotId> slot = backend.store(source);
@@ -118,14 +139,14 @@ TEST(HostSwapBackendTest, LoadKeepsSlotResidentSoItCanBeRetried) {
 
 TEST(HostSwapBackendTest, LoadUnknownSlotFails) {
     HostSwapBackend backend(4);
-    PhysicalBlock block(0, make_block_shape());
+    TestFrame block(0, make_block_shape());
 
     EXPECT_FALSE(backend.load(9999, block));
 }
 
 TEST(HostSwapBackendTest, DiscardDropsSlotAndPreventsLoad) {
     HostSwapBackend backend(4);
-    PhysicalBlock block(0, make_block_shape());
+    TestFrame block(0, make_block_shape());
 
     const std::optional<SwapSlotId> slot = backend.store(block);
     ASSERT_TRUE(slot.has_value());
@@ -138,8 +159,8 @@ TEST(HostSwapBackendTest, DiscardDropsSlotAndPreventsLoad) {
 
 TEST(HostSwapBackendTest, StoreFailsWhenSwapSpaceIsFull) {
     HostSwapBackend backend(1);
-    PhysicalBlock first(0, make_block_shape());
-    PhysicalBlock second(1, make_block_shape());
+    TestFrame first(0, make_block_shape());
+    TestFrame second(1, make_block_shape());
 
     ASSERT_TRUE(backend.store(first).has_value());
 
@@ -149,8 +170,8 @@ TEST(HostSwapBackendTest, StoreFailsWhenSwapSpaceIsFull) {
 
 TEST(HostSwapBackendTest, DiscardFreesCapacityForAnotherStore) {
     HostSwapBackend backend(1);
-    PhysicalBlock first(0, make_block_shape());
-    PhysicalBlock second(1, make_block_shape());
+    TestFrame first(0, make_block_shape());
+    TestFrame second(1, make_block_shape());
 
     const std::optional<SwapSlotId> slot = backend.store(first);
     ASSERT_TRUE(slot.has_value());
@@ -162,15 +183,15 @@ TEST(HostSwapBackendTest, DiscardFreesCapacityForAnotherStore) {
 
 TEST(HostSwapBackendTest, StoredCopyIsIndependentOfTheSourceBlock) {
     HostSwapBackend backend(4);
-    PhysicalBlock source(0, make_block_shape());
-    PhysicalBlock restored(1, make_block_shape());
+    TestFrame source(0, make_block_shape());
+    TestFrame restored(1, make_block_shape());
     fill_block(source, 11);
 
     const std::optional<SwapSlotId> slot = backend.store(source);
     ASSERT_TRUE(slot.has_value());
 
     // Overwriting the source after the store must not change what was swapped.
-    PhysicalBlock expected(2, make_block_shape());
+    TestFrame expected(2, make_block_shape());
     fill_block(expected, 11);
     fill_block(source, 99);
 

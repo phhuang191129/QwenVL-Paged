@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <utility>
 
 namespace qwenvl_paged {
@@ -57,12 +56,13 @@ struct BlockShape {
 };
 
 /**
- * @brief Host allocation policy for CPU-backed physical blocks.
+ * @brief Host allocation policy for the block pool.
  *
- * The first implementation should use C++17 `std::aligned_alloc` with
- * `std::free`. Future CUDA builds can switch this allocation boundary to
- * `cudaMallocHost`/`cudaFreeHost` without changing scheduler or block-table
- * ownership semantics.
+ * The alignment applies to the pool base and to the per-frame stride, so every
+ * frame inherits it. The CPU build uses C++17 `std::aligned_alloc` with
+ * `std::free`; a CUDA build can switch that single allocation site to
+ * `cudaMallocHost`/`cudaFreeHost` or `cudaMalloc` without changing scheduler or
+ * block-table ownership semantics.
  */
 struct HostMemoryOptions {
     std::size_t alignment_bytes{kDefaultBlockAlignmentBytes};
@@ -89,29 +89,31 @@ struct LogicalBlock {
 };
 
 /**
- * @brief RAII-owned CPU memory backing one physical PagedAttention block.
+ * @brief One frame in the allocator's contiguous block pool.
  *
- * The CPU prototype owns aligned host bytes with a smart pointer and custom
- * deleter. Future GPU backends can replace the allocation functions with pinned
- * host memory or device-aware handles while preserving the physical block
- * identity and lifecycle contract.
+ * A frame does not own its bytes. MemoryAllocator allocates the whole pool as a
+ * single aligned slab and binds frame `i` to the range at
+ * `i * MemoryAllocator::block_stride_bytes()`, so a PhysicalBlockId is an offset
+ * into that slab rather than a handle to an independent allocation.
+ *
+ * That is a requirement rather than a tidiness preference. An execution backend
+ * has to mirror this pool in device memory, and the GPU kernel in
+ * `tools/triton_kernel/paged_attention_decode.py` addresses it arithmetically as
+ * `physical_id * elements_per_block` with no pointer table. Per-frame
+ * allocations can satisfy neither, because nothing constrains where they land
+ * relative to each other. Switching the pool to `cudaMalloc` is then one
+ * allocation site, not one per block.
  */
 class PhysicalBlock {
 public:
     /**
-     * @brief Allocates an aligned host-backed physical block.
+     * @brief Binds a frame identity and shape to storage owned by the pool.
      */
     PhysicalBlock(
         PhysicalBlockId id,
         BlockShape shape,
-        HostMemoryOptions memory_options = {});
-
-    ~PhysicalBlock() = default;
-
-    PhysicalBlock(const PhysicalBlock&) = delete;
-    PhysicalBlock& operator=(const PhysicalBlock&) = delete;
-    PhysicalBlock(PhysicalBlock&&) noexcept = default;
-    PhysicalBlock& operator=(PhysicalBlock&&) noexcept = default;
+        std::byte* storage,
+        std::size_t size_bytes) noexcept;
 
     /**
      * @brief Returns the allocator-wide stable block identifier.
@@ -134,35 +136,15 @@ public:
     [[nodiscard]] const std::byte* data() const noexcept;
 
     /**
-     * @brief Returns the allocated byte capacity of this block.
+     * @brief Returns the byte capacity of this frame's slice of the pool.
      */
     [[nodiscard]] std::size_t size_bytes() const noexcept;
 
-    /**
-     * @brief Returns the byte alignment requested for this block allocation.
-     */
-    [[nodiscard]] std::size_t alignment_bytes() const noexcept;
-
-    /**
-     * @brief Returns true when the backing allocation was requested as pinned.
-     */
-    [[nodiscard]] bool pinned_memory_requested() const noexcept;
-
-    /**
-     * @brief Swaps this block's storage with another physical block.
-     */
-    void swap(PhysicalBlock& other) noexcept;
-
 private:
-    static void release_host_memory(std::byte* ptr) noexcept;
-
     PhysicalBlockId id_{0};
     BlockShape shape_{};
-    HostMemoryOptions memory_options_{};
+    std::byte* storage_{nullptr};
     std::size_t size_bytes_{0};
-    std::unique_ptr<std::byte, decltype(&PhysicalBlock::release_host_memory)> storage_{
-        nullptr,
-        &PhysicalBlock::release_host_memory};
 };
 
 } // namespace qwenvl_paged

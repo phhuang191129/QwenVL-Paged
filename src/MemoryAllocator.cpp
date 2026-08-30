@@ -1,18 +1,49 @@
 #include "qwenvl_paged/MemoryAllocator.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
 namespace qwenvl_paged {
 
+namespace {
+
+std::size_t round_up(std::size_t value, std::size_t alignment) noexcept {
+    if (alignment == 0) {
+        return value;
+    }
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+} // namespace
+
 MemoryAllocator::MemoryAllocator(AllocatorConfig config) : config_(config) {
+    const std::size_t alignment =
+        config_.memory_options.alignment_bytes == 0 ? kDefaultBlockAlignmentBytes
+                                                    : config_.memory_options.alignment_bytes;
+
+    // Rounding the stride to the alignment keeps every frame aligned, not just
+    // the pool base, so a backend can DMA any single frame on its own.
+    block_stride_bytes_ = round_up(config_.block_shape.byte_size(), alignment);
+    if (block_stride_bytes_ == 0) {
+        block_stride_bytes_ = alignment;
+    }
+
+    // std::aligned_alloc requires a size that is a multiple of the alignment,
+    // which a whole number of aligned strides already is.
+    pool_bytes_ = block_stride_bytes_ * config_.max_blocks;
+    if (pool_bytes_ > 0) {
+        pool_.reset(static_cast<std::byte*>(std::aligned_alloc(alignment, pool_bytes_)));
+    }
+
     blocks_.reserve(config_.max_blocks);
     infos_.reserve(config_.max_blocks);
     free_list_.reserve(config_.max_blocks);
 
     for (std::uint32_t i = 0; i < config_.max_blocks; ++i) {
         const PhysicalBlockId id = i;
-        blocks_.push_back(std::make_unique<PhysicalBlock>(id, config_.block_shape, config_.memory_options));
+        std::byte* storage = pool_ == nullptr ? nullptr : pool_.get() + static_cast<std::size_t>(id) * block_stride_bytes_;
+        blocks_.emplace_back(id, config_.block_shape, storage, block_stride_bytes_);
 
         PhysicalBlockInfo info;
         info.id = id;
@@ -88,14 +119,14 @@ PhysicalBlock* MemoryAllocator::block(PhysicalBlockId id) noexcept {
     if (id >= blocks_.size()) {
         return nullptr;
     }
-    return blocks_[id].get();
+    return &blocks_[id];
 }
 
 const PhysicalBlock* MemoryAllocator::block(PhysicalBlockId id) const noexcept {
     if (id >= blocks_.size()) {
         return nullptr;
     }
-    return blocks_[id].get();
+    return &blocks_[id];
 }
 
 void MemoryAllocator::set_swap_backend(SwapBackend* backend) noexcept {
@@ -199,15 +230,41 @@ AllocatorStats MemoryAllocator::stats() const noexcept {
         stats.swapped_blocks = static_cast<std::uint32_t>(swap_backend_->resident_slots());
     }
 
-    for (const std::unique_ptr<PhysicalBlock>& block : blocks_) {
-        stats.bytes_reserved += block->size_bytes();
-    }
+    stats.bytes_reserved = pool_bytes_;
 
     return stats;
 }
 
 bool MemoryAllocator::can_allocate(std::uint32_t block_count) const noexcept {
     return free_list_.size() >= block_count;
+}
+
+std::byte* MemoryAllocator::pool_base() noexcept {
+    return pool_.get();
+}
+
+const std::byte* MemoryAllocator::pool_base() const noexcept {
+    return pool_.get();
+}
+
+std::size_t MemoryAllocator::block_stride_bytes() const noexcept {
+    return block_stride_bytes_;
+}
+
+std::size_t MemoryAllocator::pool_bytes() const noexcept {
+    return pool_bytes_;
+}
+
+std::size_t MemoryAllocator::alignment_bytes() const noexcept {
+    return config_.memory_options.alignment_bytes;
+}
+
+bool MemoryAllocator::pinned_memory_requested() const noexcept {
+    return config_.memory_options.prefer_pinned_memory;
+}
+
+void MemoryAllocator::release_pool_memory(std::byte* ptr) noexcept {
+    std::free(ptr);
 }
 
 } // namespace qwenvl_paged

@@ -67,74 +67,31 @@ TEST(LogicalBlockTest, BlockWithCommittedTokensIsNotEmpty) {
 
 TEST(PhysicalBlockTest, ExposesIdAndShape) {
     const BlockShape shape = make_shape();
-    PhysicalBlock block(7, shape);
+    std::vector<std::byte> storage(shape.byte_size());
+    PhysicalBlock block(7, shape, storage.data(), storage.size());
 
     EXPECT_EQ(block.id(), 7u);
     EXPECT_EQ(block.shape().byte_size(), shape.byte_size());
+    EXPECT_EQ(block.size_bytes(), storage.size());
 }
 
-TEST(PhysicalBlockTest, AllocationSatisfiesRequestedAlignment) {
-    HostMemoryOptions options;
-    options.alignment_bytes = kDefaultBlockAlignmentBytes;
-
-    // Allocate many live blocks at once. A single block can be aligned by luck
-    // even from an allocator that ignores alignment, so checking a whole batch
-    // that stays alive simultaneously makes an unaligned implementation fail
-    // with near-certainty rather than by chance.
-    constexpr std::size_t kBlockCount = 64;
-    std::vector<PhysicalBlock> blocks;
-    blocks.reserve(kBlockCount);
-    for (std::size_t i = 0; i < kBlockCount; ++i) {
-        blocks.emplace_back(static_cast<PhysicalBlockId>(i), make_shape(), options);
-    }
-
-    for (const PhysicalBlock& block : blocks) {
-        ASSERT_NE(block.data(), nullptr);
-        EXPECT_EQ(block.alignment_bytes(), kDefaultBlockAlignmentBytes);
-        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(block.data()) % kDefaultBlockAlignmentBytes, 0u);
-    }
-}
-
-TEST(PhysicalBlockTest, SizeCoversShapeAndIsAlignmentRounded) {
-    HostMemoryOptions options;
-    options.alignment_bytes = kDefaultBlockAlignmentBytes;
-
+TEST(PhysicalBlockTest, FrameIsAWindowOntoPoolStorageRatherThanACopy) {
     const BlockShape shape = make_shape();
-    PhysicalBlock block(1, shape, options);
+    std::vector<std::byte> storage(shape.byte_size());
+    PhysicalBlock block(0, shape, storage.data(), storage.size());
 
-    EXPECT_GE(block.size_bytes(), shape.byte_size());
-    EXPECT_EQ(block.size_bytes() % kDefaultBlockAlignmentBytes, 0u);
+    ASSERT_EQ(block.data(), storage.data());
+
+    // The pool owns the bytes, so a write through the frame has to land in the
+    // pool. Anything else would mean a device mirror of the pool could not be
+    // produced by copying the pool.
+    block.data()[0] = std::byte{0xAB};
+    EXPECT_EQ(storage[0], std::byte{0xAB});
 }
 
-TEST(PhysicalBlockTest, PinnedMemoryRequestIsReported) {
-    HostMemoryOptions options;
-    options.prefer_pinned_memory = true;
-
-    PhysicalBlock block(1, make_shape(), options);
-
-    EXPECT_TRUE(block.pinned_memory_requested());
-}
-
-TEST(PhysicalBlockTest, SwapExchangesStorageContents) {
-    const BlockShape shape = make_shape();
-    PhysicalBlock first(1, shape);
-    PhysicalBlock second(2, shape);
-
-    ASSERT_GE(first.size_bytes(), 4u);
-    ASSERT_GE(second.size_bytes(), 4u);
-
-    for (std::size_t i = 0; i < 4; ++i) {
-        first.data()[i] = static_cast<std::byte>(0xA0 + i);
-        second.data()[i] = static_cast<std::byte>(0xB0 + i);
-    }
-
-    first.swap(second);
-
-    for (std::size_t i = 0; i < 4; ++i) {
-        EXPECT_EQ(first.data()[i], static_cast<std::byte>(0xB0 + i));
-        EXPECT_EQ(second.data()[i], static_cast<std::byte>(0xA0 + i));
-    }
-}
+// Alignment, stride rounding, and the pinned-memory request are properties of
+// the pool that owns the slab, not of an individual frame, so they are asserted
+// in MemoryAllocator.test.cpp.
 
 } // namespace
 } // namespace qwenvl_paged

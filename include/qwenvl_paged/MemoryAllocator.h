@@ -188,9 +188,54 @@ public:
      */
     [[nodiscard]] bool can_allocate(std::uint32_t block_count) const noexcept;
 
+    /**
+     * @brief Returns the base of the single slab backing every frame.
+     *
+     * Frame `id` occupies `[pool_base() + id * block_stride_bytes(),
+     * block_stride_bytes())`. An execution backend mirrors the pool by copying
+     * this range and indexing it by the same ids, which is what lets a device
+     * kernel resolve a block without a host-supplied pointer table.
+     */
+    [[nodiscard]] std::byte* pool_base() noexcept;
+
+    /**
+     * @brief Returns the immutable base of the slab backing every frame.
+     */
+    [[nodiscard]] const std::byte* pool_base() const noexcept;
+
+    /**
+     * @brief Returns the byte distance between consecutive frames.
+     *
+     * This is `BlockShape::byte_size()` rounded up to the configured alignment,
+     * so it can exceed the bytes a block's contents actually occupy.
+     */
+    [[nodiscard]] std::size_t block_stride_bytes() const noexcept;
+
+    /**
+     * @brief Returns the total byte size of the slab.
+     */
+    [[nodiscard]] std::size_t pool_bytes() const noexcept;
+
+    /**
+     * @brief Returns the byte alignment applied to the pool and to each frame.
+     */
+    [[nodiscard]] std::size_t alignment_bytes() const noexcept;
+
+    /**
+     * @brief Returns true when the pool allocation was requested as pinned.
+     */
+    [[nodiscard]] bool pinned_memory_requested() const noexcept;
+
 private:
+    static void release_pool_memory(std::byte* ptr) noexcept;
+
     AllocatorConfig config_{};
-    std::vector<std::unique_ptr<PhysicalBlock>> blocks_;
+    std::size_t block_stride_bytes_{0};
+    std::size_t pool_bytes_{0};
+    std::unique_ptr<std::byte, decltype(&MemoryAllocator::release_pool_memory)> pool_{
+        nullptr,
+        &MemoryAllocator::release_pool_memory};
+    std::vector<PhysicalBlock> blocks_;
     std::vector<PhysicalBlockInfo> infos_;
     std::vector<PhysicalBlockId> free_list_;
     SwapBackend* swap_backend_{nullptr};
