@@ -1405,6 +1405,18 @@ moved with it on this run (30.98 → 30.38). Absolute kernel wall was 34.90 →
 CUDA graph can capture. What is left of write is 70 µs/layer of two small
 device copies — a store kernel is the next lever there, not more Python.
 
+### Finding 6: one launch is slower, so the 2.6 ms is occupancy, not a second launch
+
+`num_partitions=1` in the forward path was the cheap test of "the reduce is
+paying for a problem we no longer have." Launch went 2.64 → 6.97 ms/step, and
+the kernel wall versus dense went +3.92 → +8.13. The isolated week 16 result
+still holds inside the model: one program per head leaves the device idle, and
+that idle time is larger than a second launch plus a reduce.
+
+The change was reverted. Partitioning stays the default. A CUDA graph would
+now have to capture the partitioned pair, not a single kernel, and it would
+be capturing useful device work rather than empty launch overhead.
+
 ### Verification status
 
 | Check | Status |

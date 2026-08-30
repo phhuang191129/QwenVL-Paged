@@ -330,6 +330,8 @@ class PagedLayer(CacheLayerMixin):
         q = query[:, :, 0, :].contiguous()
         table, context = self.pool.decode_inputs(self.sequence_id, self.length)
         layout = self.pool.layout
+        # Leave num_partitions to the wrapper. Forcing 1 made launch 2.6 -> 7 ms;
+        # see docs/performance.md week 21 finding 6.
         out = paged_attention_decode_partitioned(
             self.pool.frames,
             table,
