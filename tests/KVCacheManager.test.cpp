@@ -13,12 +13,15 @@
 
 #include "qwenvl_paged/KVCacheManager.h"
 #include "qwenvl_paged/MemoryAllocator.h"
+#include "qwenvl_paged/PagedAttention.h"
 #include "qwenvl_paged/SwapBackend.h"
 
 #include <gtest/gtest.h>
 
 #include <cstddef>
 #include <optional>
+#include <string>
+#include <vector>
 
 namespace qwenvl_paged {
 namespace {
@@ -376,6 +379,136 @@ TEST(KVCacheManagerTest, ForkRefusesASwappedOutParent) {
 
     ASSERT_TRUE(manager.swap_in_sequence(1));
     EXPECT_TRUE(manager.fork_sequence(1, make_metadata(2)));
+}
+
+TEST(KVCacheManagerTest, SequencesForReturnsForksOfTheSameRequest) {
+    MemoryAllocator allocator(make_allocator_config());
+    KVCacheManager manager(allocator);
+    ASSERT_TRUE(manager.create_sequence(make_metadata(1, 7)));
+    ASSERT_TRUE(manager.fork_sequence(1, make_metadata(2, 7)));
+
+    const std::vector<SequenceId> ids = manager.sequences_for(7);
+    ASSERT_EQ(ids.size(), 2u);
+    EXPECT_EQ(ids[0], 1u);
+    EXPECT_EQ(ids[1], 2u);
+    EXPECT_TRUE(manager.sequences_for(99).empty());
+}
+
+TEST(KVCacheManagerTest, ReleaseRequestDropsEverySequence) {
+    MemoryAllocator allocator(make_allocator_config());
+    KVCacheManager manager(allocator);
+    ASSERT_TRUE(manager.create_sequence(make_metadata(1, 7)));
+    ASSERT_TRUE(manager.reserve_tokens(1, kTokensPerBlock));
+    ASSERT_TRUE(manager.fork_sequence(1, make_metadata(2, 7)));
+
+    manager.release_request(7);
+
+    EXPECT_FALSE(manager.contains(1));
+    EXPECT_FALSE(manager.contains(2));
+    EXPECT_TRUE(manager.sequences_for(7).empty());
+    EXPECT_EQ(allocator.stats().free_blocks, allocator.stats().total_blocks);
+}
+
+TEST(KVCacheManagerTest, PrefixPublishAndAttachSharesBlocks) {
+    MemoryAllocator allocator(make_allocator_config());
+    KVCacheManager manager(allocator);
+    ASSERT_TRUE(manager.create_sequence(make_metadata(1, 1)));
+    ASSERT_TRUE(manager.reserve_tokens(1, kTokensPerBlock * 2));
+    fill_block(*allocator.block(*manager.cache_view(1)->block_table->lookup(0)), 11);
+    fill_block(*allocator.block(*manager.cache_view(1)->block_table->lookup(1)), 12);
+
+    ASSERT_TRUE(manager.publish_prefix(1, "sys-img"));
+    EXPECT_EQ(manager.prefix_token_count("sys-img"), kTokensPerBlock * 2);
+
+    ASSERT_TRUE(manager.create_sequence(make_metadata(2, 2)));
+    EXPECT_EQ(manager.attach_prefix(2, "sys-img"), kTokensPerBlock * 2);
+    EXPECT_EQ(manager.cache_view(2)->block_table->lookup(0), manager.cache_view(1)->block_table->lookup(0));
+    EXPECT_EQ(allocator.info(*manager.cache_view(1)->block_table->lookup(0))->ref_count, 3u);
+
+    const std::optional<PhysicalBlockId> child = manager.ensure_token_writable(2, 0);
+    ASSERT_TRUE(child.has_value());
+    EXPECT_NE(*child, *manager.cache_view(1)->block_table->lookup(0));
+}
+
+TEST(KVCacheManagerTest, PrefixCollisionDoesNotShare) {
+    MemoryAllocator allocator(make_allocator_config());
+    KVCacheManager manager(allocator);
+    ASSERT_TRUE(manager.create_sequence(make_metadata(1, 1)));
+    ASSERT_TRUE(manager.create_sequence(make_metadata(2, 2)));
+    ASSERT_TRUE(manager.reserve_tokens(1, kTokensPerBlock));
+    ASSERT_TRUE(manager.reserve_tokens(2, kTokensPerBlock));
+    fill_block(*allocator.block(*manager.cache_view(1)->block_table->lookup(0)), 1);
+    fill_block(*allocator.block(*manager.cache_view(2)->block_table->lookup(0)), 99);
+
+    ASSERT_TRUE(manager.publish_prefix(1, "same-key"));
+    ASSERT_TRUE(manager.publish_prefix(2, "same-key"));
+    EXPECT_EQ(manager.prefix_token_count("same-key"), 0u);
+
+    ASSERT_TRUE(manager.create_sequence(make_metadata(3, 3)));
+    EXPECT_EQ(manager.attach_prefix(3, "same-key"), 0u);
+    EXPECT_TRUE(manager.cache_view(3)->block_table->empty());
+}
+
+TEST(KVCacheManagerTest, PrefixReleaseOfOneSharerLeavesTheOther) {
+    MemoryAllocator allocator(make_allocator_config());
+    KVCacheManager manager(allocator);
+    ASSERT_TRUE(manager.create_sequence(make_metadata(1, 1)));
+    ASSERT_TRUE(manager.reserve_tokens(1, kTokensPerBlock));
+    fill_block(*allocator.block(*manager.cache_view(1)->block_table->lookup(0)), 3);
+    ASSERT_TRUE(manager.publish_prefix(1, "shared"));
+
+    ASSERT_TRUE(manager.create_sequence(make_metadata(2, 2)));
+    ASSERT_EQ(manager.attach_prefix(2, "shared"), kTokensPerBlock);
+
+    manager.release_sequence(1);
+    EXPECT_TRUE(manager.contains(2));
+    EXPECT_TRUE(manager.cache_view(2)->block_table->lookup(0).has_value());
+    EXPECT_EQ(manager.prefix_token_count("shared"), kTokensPerBlock);
+
+    manager.release_sequence(2);
+    EXPECT_EQ(allocator.stats().free_blocks, allocator.stats().total_blocks);
+    EXPECT_EQ(allocator.stats().shared_blocks, 0u);
+    EXPECT_EQ(manager.prefix_token_count("shared"), 0u);
+}
+
+TEST(KVCacheManagerTest, SharedPrefixProducesIdenticalAttention) {
+    AllocatorConfig config = make_allocator_config();
+    config.block_shape.bytes_per_element = static_cast<std::uint32_t>(sizeof(float));
+    MemoryAllocator allocator(config);
+    KVCacheManager manager(allocator);
+
+    ASSERT_TRUE(manager.create_sequence(make_metadata(1, 1)));
+    ASSERT_TRUE(manager.create_sequence(make_metadata(2, 2)));
+    ASSERT_TRUE(manager.reserve_tokens(1, kTokensPerBlock));
+    ASSERT_TRUE(manager.reserve_tokens(2, kTokensPerBlock));
+
+    const KVBlockLayout layout{allocator.block(0)->shape()};
+    auto write_pattern = [&](SequenceId seq, std::uint32_t seed) {
+        const PhysicalBlockId id = *manager.ensure_token_writable(seq, 0);
+        float* base = reinterpret_cast<float*>(allocator.block(id)->data());
+        for (std::uint32_t i = 0; i < layout.element_count(); ++i) {
+            base[i] = static_cast<float>((i + seed) % 17) * 0.1F;
+        }
+    };
+    write_pattern(1, 4);
+    write_pattern(2, 4);
+    ASSERT_TRUE(manager.publish_prefix(1, "attn"));
+    ASSERT_TRUE(manager.create_sequence(make_metadata(3, 3)));
+    ASSERT_EQ(manager.attach_prefix(3, "attn"), kTokensPerBlock);
+
+    const std::vector<float> query(16, 0.25F);
+    std::vector<float> independent(16, 0.0F);
+    std::vector<float> shared(16, 0.0F);
+    PagedAttentionParams params;
+    params.layer = 0;
+    params.num_query_heads = 2;
+    params.context_len = 1;
+    params.scale = 1.0F;
+    ASSERT_TRUE(paged_attention_decode<float>(*manager.cache_view(2), query.data(), params, independent.data()));
+    ASSERT_TRUE(paged_attention_decode<float>(*manager.cache_view(3), query.data(), params, shared.data()));
+    for (std::size_t i = 0; i < independent.size(); ++i) {
+        EXPECT_FLOAT_EQ(independent[i], shared[i]);
+    }
 }
 
 } // namespace

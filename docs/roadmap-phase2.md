@@ -10,11 +10,9 @@ the reasoning behind what exists. This document is the plan for what comes next:
 weeks 9–16, with the early phases specified in detail and the later ones sketched
 to the level where their first task is unambiguous.
 
-**Status after the L4 session.** Weeks 9, 13, and 15–16 are done, plus the
-device-pool / kernel / memory work recorded as weeks 17–23 in
-[`performance.md`](performance.md). The GPU box is closed. **Next is week 14**
-(serving policy, CPU, week-9 traces). Weeks 11–12 (fast CPU kernel) are still
-open and do not need a GPU. Do not treat weeks 15–16 as upcoming.
+**Status after week 14.** Weeks 9, 13–14, and 15–23 are done. The GPU box is
+closed. **Next is weeks 10–12** (roofline, then the CPU kernel). Those do not
+need a GPU. Do not treat weeks 15–16 as upcoming.
 
 **Contents**
 
@@ -266,15 +264,17 @@ modelled rather than wished away.
 
 ### What week 9 changed downstream
 
-- **Week 14 has a measured mandate, not a stylistic one.** `schedule_next` admits
-  on whether a prompt fits, never on whether the prompt plus its decode budget
-  fits, so it over-commits the pool and then stalls. The replay driver works
-  around it by preempting on decode-growth failure, which costs 72 preemptions
-  and 3,441 failed resume attempts to finish 400 requests at a 256-block pool.
-  Decode-aware admission moves from "nice to have" to a numbered requirement.
-- **Preemption must follow sampling branches.** `Scheduler::preempt` swaps out the
-  root sequence only, so a preempted request with live forks reclaims almost
-  nothing. This blocks combining parallel sampling with memory pressure.
+- **Week 14 had a measured mandate, not a stylistic one.** `schedule_next`
+  admitted on whether a prompt fit, never on whether the prompt plus its decode
+  budget fit, so it over-committed the pool and then stalled. The replay driver
+  worked around it by preempting on decode-growth failure, which cost 72
+  preemptions and 3,441 failed resume attempts to finish 400 requests at a
+  256-block pool. Decode-aware admission was the numbered requirement; it is
+  done, and that thrash is now zero. See [`performance.md`](performance.md)
+  week 14.
+- **Preemption must follow sampling branches.** Week 14's `preempt` /
+  `resume` / `cancel` are request-scoped, so private fork frames reclaim with
+  the request. Shared prompt frames still follow the existing refcount rule.
 - **Week 10 has a second block shape to report.** The real 2B block is 1.75 MiB,
   3.5x the 512 KiB shape the week 8 table used, and copy-on-write cost is pure
   memory bandwidth, so every CoW figure scales with it.
@@ -496,6 +496,31 @@ an honest baseline and a number on both sides.
 - Zero leaks with prefix sharing active, including the case where one sharer is
   cancelled mid-decode and the other continues.
 
+### Week 14 outcome
+
+All four milestones shipped. The numbers are in
+[`performance.md`](performance.md). Three things went differently than planned.
+
+**Decode-aware admission did what week 9 asked.** Same image-heavy pool sweep:
+preemptions and failed resumes go from 72 / 3,441 at pool 256 to 0 / 0 at every
+pool. The tradeoff is conservative packing — 38% more steps and peak batch
+4 → 3 at that pool — because a lifetime reservation is larger than a prompt.
+Paged still beats contiguous, but the margin shrinks; the week-9 paged win was
+partly "over-admit and recover."
+
+**Chunked prefill and size-aware did not move p99 TTFT.** On the closed-loop
+token-cost clock, a 1,292-token image then a 326-token text request is 1,620
+with or without 256-token chunks. Size-aware vs FIFO is identical on the
+week-9 912-block bimodal pool (the head always fits) and 3.5% fewer steps at
+256 blocks. FIFO stays the default; size-aware is opt-in with a tested skip
+limit. The serving-policy success criterion is met by decode-aware and prefix
+cache, not by a tail-latency win over FIFO.
+
+**Prefix cache hits, and peak cache went up.** 232 hits, 16,606 blocks saved,
+utilization 1.098, leak-free. Peak blocks 702 → 830 because publish pins the
+partial tail and decode CoWs it. Quote the hit rate and the allocation-time
+saving; do not quote 16,606 as a peak-memory win.
+
 ---
 
 ## Weeks 15–16: Triton Kernel On GPU
@@ -571,8 +596,7 @@ GPU-ready in four specific places; this phase is where that claim is tested.
 
 If time runs short, drop in this order — first to go listed first:
 
-1. Week 14's prefix caching (the largest engineering effort of the three policy
-   experiments).
+1. Week 14's prefix caching — shipped; no longer available to cut.
 2. Week 16's quantized KV cache.
 3. Week 11's multithreaded kernel path.
 4. The vLLM comparative study, reduced from a document to a section.
@@ -599,8 +623,10 @@ Do **not** cut, in any circumstance:
   roofline ruled out.
 - The paging tax quantified: the cost of block-table translation isolated from
   the cost of attention itself.
-- A serving-policy result on a real bimodal VLM workload, showing throughput or
-  tail-latency improvement over the FIFO baseline the project shipped in week 6.
+- A serving-policy result on a real bimodal VLM workload. Week 14 delivered
+  decode-aware admission (preemption thrash 72 / 3,441 → 0 / 0) and a
+  prefix-cache hit rate, not a p99 TTFT win over FIFO; that contradiction is
+  recorded in [`performance.md`](performance.md).
 - A Triton kernel validated against the CPU golden vectors, profiled with
   Nsight, with its bottleneck identified and confirmed to have moved.
 - Every number reproducible from a committed script.

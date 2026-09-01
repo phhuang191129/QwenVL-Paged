@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace qwenvl_paged {
@@ -50,13 +51,21 @@ SchedulerConfig make_scheduler_config() {
 /**
  * @brief Builds a simple text request with a short prompt.
  */
+void finish_scheduled_prefill(Scheduler& scheduler, const BatchPlan& plan) {
+    for (std::size_t i = 0; i < plan.prefill_requests.size(); ++i) {
+        scheduler.complete_step(plan.prefill_requests[i], plan.prefill_tokens[i]);
+    }
+}
+
 Request make_request(RequestId request_id, std::uint32_t prompt_tokens = 32) {
     Request request;
     request.request_id = request_id;
     request.root_sequence_id = request_id;
     request.prompt_tokens = prompt_tokens;
     request.sampling.num_parallel_samples = 1;
-    request.sampling.max_decode_tokens = 8;
+    // Zero so existing tests measure prompt admission only. Decode-aware tests
+    // set an explicit budget; a non-zero default would add a phantom block.
+    request.sampling.max_decode_tokens = 0;
     return request;
 }
 
@@ -105,9 +114,10 @@ TEST_F(SchedulerTest, ScheduleNextAdmitsPendingAsPrefill) {
 
 TEST_F(SchedulerTest, CompleteStepMovesPrefillToDecode) {
     scheduler_.enqueue(make_request(1));
-    static_cast<void>(scheduler_.schedule_next());
+    const BatchPlan plan = scheduler_.schedule_next();
+    ASSERT_EQ(plan.prefill_tokens.size(), 1u);
 
-    scheduler_.complete_step(1, 1);
+    scheduler_.complete_step(1, plan.prefill_tokens.front());
 
     EXPECT_EQ(scheduler_.state(1), RequestState::Decode);
 }
@@ -306,8 +316,8 @@ TEST_F(SchedulerMemoryPressureTest, SimulationDrainsMixedRequestsUnderPressure) 
         }
 
         const BatchPlan plan = scheduler_.schedule_next();
-        for (const RequestId id : plan.prefill_requests) {
-            scheduler_.complete_step(id, 1);
+        for (std::size_t i = 0; i < plan.prefill_requests.size(); ++i) {
+            scheduler_.complete_step(plan.prefill_requests[i], plan.prefill_tokens[i]);
         }
         for (const RequestId id : plan.decode_requests) {
             scheduler_.complete_step(id, 1);
@@ -370,15 +380,18 @@ struct WatermarkHarness {
 TEST(SchedulerWatermarkTest, ZeroWatermarkLeavesAutomaticPreemptionDisabled) {
     WatermarkHarness harness(0);
     harness.scheduler.enqueue(make_request(1, 64)); // four blocks fills the pool
-    ASSERT_EQ(harness.scheduler.schedule_next().prefill_requests.size(), 1u);
+    const BatchPlan first = harness.scheduler.schedule_next();
+    ASSERT_EQ(first.prefill_requests.size(), 1u);
+    finish_scheduled_prefill(harness.scheduler, first);
     ASSERT_EQ(harness.allocator.stats().free_blocks, 0u);
 
     harness.scheduler.enqueue(make_request(2, 32));
     const BatchPlan plan = harness.scheduler.schedule_next();
 
     // A zero watermark keeps the Week 7 behavior: preemption stays caller-driven.
+    // Request 1 is Decode so it is not a prefill; request 2 must stay pending.
     EXPECT_TRUE(plan.prefill_requests.empty());
-    EXPECT_EQ(harness.scheduler.state(1), RequestState::Prefill);
+    EXPECT_EQ(harness.scheduler.state(1), RequestState::Decode);
     EXPECT_EQ(harness.scheduler.state(2), RequestState::Pending);
     EXPECT_FALSE(harness.scheduler.preemption_info(1).has_value());
 }
@@ -407,16 +420,18 @@ TEST(SchedulerWatermarkTest, AdmissionPreemptsAnActiveRequestToMakeRoom) {
 TEST(SchedulerWatermarkTest, PreemptionPicksTheNewestActiveRequest) {
     WatermarkHarness harness(1);
     harness.scheduler.enqueue(make_request(1, 16));
-    static_cast<void>(harness.scheduler.schedule_next());
+    finish_scheduled_prefill(harness.scheduler, harness.scheduler.schedule_next());
     harness.scheduler.enqueue(make_request(2, 16));
-    static_cast<void>(harness.scheduler.schedule_next());
+    finish_scheduled_prefill(harness.scheduler, harness.scheduler.schedule_next());
     ASSERT_EQ(harness.allocator.stats().free_blocks, 2u);
 
     harness.scheduler.enqueue(make_request(3, 32));
-    ASSERT_EQ(harness.scheduler.schedule_next().prefill_requests.size(), 1u);
+    const BatchPlan plan = harness.scheduler.schedule_next();
+    ASSERT_EQ(plan.prefill_requests.size(), 1u);
+    EXPECT_EQ(plan.prefill_requests.front(), 3u);
 
     // The oldest request is closest to finishing, so the newest is evicted.
-    EXPECT_EQ(harness.scheduler.state(1), RequestState::Prefill);
+    EXPECT_EQ(harness.scheduler.state(1), RequestState::Decode);
     EXPECT_EQ(harness.scheduler.state(2), RequestState::Preempted);
     EXPECT_EQ(harness.scheduler.state(3), RequestState::Prefill);
 }
@@ -456,7 +471,7 @@ TEST(SchedulerWatermarkTest, PromptNeedingTheWholePoolStillAdmits) {
 TEST(SchedulerWatermarkTest, PromptLargerThanThePoolStaysPendingWithoutPreempting) {
     WatermarkHarness harness(1);
     harness.scheduler.enqueue(make_request(1, 16));
-    static_cast<void>(harness.scheduler.schedule_next());
+    finish_scheduled_prefill(harness.scheduler, harness.scheduler.schedule_next());
     ASSERT_EQ(harness.scheduler.active_size(), 1u);
 
     // Five blocks of prompt can never fit a four-block pool. Preempting the
@@ -465,7 +480,7 @@ TEST(SchedulerWatermarkTest, PromptLargerThanThePoolStaysPendingWithoutPreemptin
     const BatchPlan plan = harness.scheduler.schedule_next();
 
     EXPECT_TRUE(plan.prefill_requests.empty());
-    EXPECT_EQ(harness.scheduler.state(1), RequestState::Prefill);
+    EXPECT_EQ(harness.scheduler.state(1), RequestState::Decode);
     EXPECT_EQ(harness.scheduler.state(2), RequestState::Pending);
     EXPECT_FALSE(harness.cache_manager.contains(2));
 }
@@ -475,7 +490,9 @@ TEST(SchedulerWatermarkTest, StopsPreemptingWhenPreemptionReclaimsNoBlocks) {
     // Admit one block at a time so all three are active before the pressure hits.
     for (RequestId id = 1; id <= 3u; ++id) {
         harness.scheduler.enqueue(make_request(id, 16));
-        ASSERT_EQ(harness.scheduler.schedule_next().prefill_requests.size(), 1u);
+        const BatchPlan admitted = harness.scheduler.schedule_next();
+        ASSERT_EQ(admitted.prefill_requests.size(), 1u);
+        finish_scheduled_prefill(harness.scheduler, admitted);
     }
     ASSERT_EQ(harness.allocator.stats().free_blocks, 1u);
 
@@ -536,8 +553,8 @@ TEST(SchedulerWatermarkTest, SimulationDrainsMixedRequestsWithoutManualPreemptio
             scheduler_preempted = true;
         }
 
-        for (const RequestId id : plan.prefill_requests) {
-            harness.scheduler.complete_step(id, 1);
+        for (std::size_t i = 0; i < plan.prefill_requests.size(); ++i) {
+            harness.scheduler.complete_step(plan.prefill_requests[i], plan.prefill_tokens[i]);
         }
         for (const RequestId id : plan.decode_requests) {
             harness.scheduler.complete_step(id, 1);
@@ -556,6 +573,139 @@ TEST(SchedulerWatermarkTest, SimulationDrainsMixedRequestsWithoutManualPreemptio
     EXPECT_EQ(harness.allocator.stats().free_blocks, kWatermarkPoolBlocks);
     EXPECT_EQ(harness.allocator.stats().swapped_blocks, 0u);
     EXPECT_EQ(harness.swap_backend.resident_slots(), 0u);
+}
+
+TEST_F(SchedulerMemoryPressureTest, DecodeAwareAdmissionRefusesARequestWhoseDecodeBudgetDoesNotFit) {
+    // Pool of 4 blocks. Request 1's prompt is one block but its decode budget
+    // needs the rest of the pool; request 2 would have been admitted under
+    // prompt-only admission and then stalled mid-decode.
+    Request first = make_request(1, 16);
+    first.sampling.max_decode_tokens = 48;
+    Request second = make_request(2, 16);
+    second.sampling.max_decode_tokens = 16;
+    scheduler_.enqueue(std::move(first));
+    scheduler_.enqueue(std::move(second));
+
+    const BatchPlan plan = scheduler_.schedule_next();
+
+    ASSERT_EQ(plan.prefill_requests.size(), 1u);
+    EXPECT_EQ(plan.prefill_requests.front(), 1u);
+    EXPECT_EQ(scheduler_.state(2), RequestState::Pending);
+    EXPECT_FALSE(cache_manager_.contains(2));
+}
+
+TEST_F(SchedulerMemoryPressureTest, PreemptSwapsPrivateForkBlocks) {
+    scheduler_.enqueue(make_request(1, 32));
+    ASSERT_EQ(scheduler_.schedule_next().prefill_requests.size(), 1u);
+    ASSERT_TRUE(cache_manager_.fork_sequence(1, SequenceMetadata{2, 1, {}, {}}));
+    ASSERT_TRUE(cache_manager_.ensure_token_writable(2, 0).has_value());
+
+    const std::uint32_t free_before = allocator_.stats().free_blocks;
+    ASSERT_TRUE(scheduler_.preempt(1, "cache pressure"));
+
+    // Parent's uncopied block and the child's private copy reclaim; the block
+    // they still share stays, by the existing swap_out refcount rule.
+    EXPECT_EQ(scheduler_.preemption_info(1)->swapped_blocks, 2u);
+    EXPECT_GT(allocator_.stats().free_blocks, free_before);
+    EXPECT_EQ(cache_manager_.sequences_for(1).size(), 2u);
+}
+
+TEST(SchedulerPrefillTest, ChunkedPrefillSplitsALongPrompt) {
+    MemoryAllocator allocator(make_allocator_config(16));
+    KVCacheManager cache(allocator);
+    SchedulerConfig config = make_scheduler_config();
+    config.max_batch_tokens = 16;
+    Scheduler scheduler(config, cache, allocator);
+
+    scheduler.enqueue(make_request(1, 48));
+    const BatchPlan first = scheduler.schedule_next();
+    ASSERT_EQ(first.prefill_requests.size(), 1u);
+    EXPECT_EQ(first.prefill_tokens.front(), 16u);
+    EXPECT_EQ(first.scheduled_tokens, 16u);
+
+    scheduler.complete_step(1, 16);
+    EXPECT_EQ(scheduler.state(1), RequestState::Prefill);
+
+    const BatchPlan second = scheduler.schedule_next();
+    ASSERT_EQ(second.prefill_tokens.size(), 1u);
+    EXPECT_EQ(second.prefill_tokens.front(), 16u);
+    scheduler.complete_step(1, 16);
+    scheduler.complete_step(1, 16);
+    EXPECT_EQ(scheduler.state(1), RequestState::Decode);
+}
+
+TEST(SchedulerPrefillTest, DecodeTokensCountAgainstTheBatchBudget) {
+    MemoryAllocator allocator(make_allocator_config(16));
+    KVCacheManager cache(allocator);
+    SchedulerConfig config = make_scheduler_config();
+    config.max_batch_tokens = 1;
+    Scheduler scheduler(config, cache, allocator);
+
+    scheduler.enqueue(make_request(1, 16));
+    scheduler.enqueue(make_request(2, 16));
+    ASSERT_EQ(scheduler.schedule_next().prefill_requests.size(), 1u);
+    scheduler.complete_step(1, 16);
+    ASSERT_EQ(scheduler.state(1), RequestState::Decode);
+
+    const BatchPlan plan = scheduler.schedule_next();
+    // One token of budget: either the leftover prefill of request 2 or the
+    // decode of request 1, not both.
+    EXPECT_EQ(plan.scheduled_tokens, 1u);
+    EXPECT_EQ(plan.prefill_requests.size() + plan.decode_requests.size(), 1u);
+}
+
+TEST(SchedulerSizeAwareTest, SkipsAHeadThatDoesNotFitToAdmitASmallerRequest) {
+    MemoryAllocator allocator(make_allocator_config(4));
+    KVCacheManager cache(allocator);
+    SchedulerConfig config = make_scheduler_config();
+    config.size_aware_admission = true;
+    Scheduler scheduler(config, cache, allocator);
+
+    scheduler.enqueue(make_request(1, 48)); // 3 blocks, leaves 1 free
+    finish_scheduled_prefill(scheduler, scheduler.schedule_next());
+
+    scheduler.enqueue(make_request(2, 32)); // 2 blocks, does not fit
+    scheduler.enqueue(make_request(3, 16)); // 1 block, does
+
+    const BatchPlan plan = scheduler.schedule_next();
+    ASSERT_EQ(plan.prefill_requests.size(), 1u);
+    EXPECT_EQ(plan.prefill_requests.front(), 3u);
+    EXPECT_EQ(scheduler.state(2), RequestState::Pending);
+}
+
+TEST(SchedulerSizeAwareTest, CannotStarveALargeHead) {
+    MemoryAllocator allocator(make_allocator_config(3));
+    KVCacheManager cache(allocator);
+    SchedulerConfig config = make_scheduler_config();
+    config.size_aware_admission = true;
+    config.admission_skip_limit = 2;
+    Scheduler scheduler(config, cache, allocator);
+
+    scheduler.enqueue(make_request(1, 32)); // 2 blocks, leaves 1 free
+    finish_scheduled_prefill(scheduler, scheduler.schedule_next());
+
+    scheduler.enqueue(make_request(2, 32)); // head that does not fit
+    scheduler.enqueue(make_request(3, 16));
+    scheduler.enqueue(make_request(4, 16));
+    scheduler.enqueue(make_request(5, 16));
+
+    const BatchPlan first_skip = scheduler.schedule_next();
+    ASSERT_EQ(first_skip.prefill_requests.front(), 3u);
+    scheduler.cancel(3);
+    const BatchPlan second_skip = scheduler.schedule_next();
+    ASSERT_EQ(second_skip.prefill_requests.front(), 4u);
+    scheduler.cancel(4);
+
+    // Two successful skips; the head now blocks smaller requests behind it.
+    const BatchPlan blocked = scheduler.schedule_next();
+    EXPECT_TRUE(blocked.prefill_requests.empty());
+    EXPECT_EQ(scheduler.state(2), RequestState::Pending);
+    EXPECT_EQ(scheduler.state(5), RequestState::Pending);
+
+    scheduler.cancel(1);
+    const BatchPlan unblocked = scheduler.schedule_next();
+    ASSERT_FALSE(unblocked.prefill_requests.empty());
+    EXPECT_EQ(unblocked.prefill_requests.front(), 2u);
 }
 
 } // namespace

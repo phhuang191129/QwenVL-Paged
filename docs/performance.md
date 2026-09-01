@@ -18,11 +18,13 @@ Roadmap context: [`roadmap-phase2.md`](roadmap-phase2.md).
 | **Block shape** | 16 tokens x 28 layers x 8 KV heads x 128 dim x 2 B = **1.75 MiB/block** |
 | **Trace generator** | `transformers==4.57.1`, Python 3.12.13 |
 
-The week 9 results are workload and memory-accounting results. They involve no
-model forward pass, so no latency figure appears in that section; "steps" is a
-count of continuous-batching iterations, not time. Week 15 adds wall-clock
-timings for the attention kernel itself, on its own GPU provenance. Neither is an
-end-to-end throughput number: that needs the model integration in week 13.
+The week 9 and week 14 results are workload and memory-accounting results. They
+involve no model forward pass, so no wall-clock latency figure appears in those
+sections; "steps" is a count of continuous-batching iterations, not time. Week
+14's TTFT is a token-cost model (one scheduled prefill or decode token equals
+one unit), not a timer. Week 15 adds wall-clock timings for the attention kernel
+itself, on its own GPU provenance. None of these is an end-to-end throughput
+number: that needs the model integration in week 13.
 
 Reproduce with:
 
@@ -30,6 +32,7 @@ Reproduce with:
 ./tools/trace_gen/generate_all.sh          # needs network on first run
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ./tools/trace_replay/run_experiments.sh    # writes results/week9-*.csv
+./tools/trace_replay/run_week14.sh         # writes results/week14-*.csv
 ```
 
 ---
@@ -192,11 +195,10 @@ Paged utilization is 0.991-0.995 across the whole sweep; the baseline is flat at
 neither allocator is the binding constraint and both run the full batch of 8.
 
 **What this means for the roadmap.** Making admission itself decode-aware, rather
-than relying on driver-side recovery, is now a measured requirement for week 14
-rather than a stylistic preference. It also puts a number on the preemption
-thrash the recovery causes: at pool 256 the driver issues 72 preemptions and
-3,441 failed resume attempts to finish 400 requests, which a decode-aware
-admission policy should mostly eliminate.
+than relying on driver-side recovery, was a measured requirement for week 14
+rather than a stylistic preference. At pool 256 the driver issued 72 preemptions
+and 3,441 failed resume attempts to finish 400 requests. Week 14's decode-aware
+admission collapses that thrash to zero; the numbers are in that section.
 
 ### Verification status
 
@@ -230,6 +232,185 @@ Full suite: 141 tests pass at the time of writing; 150 as of week 17.
   to roughly 300 visual tokens and never exercise the high-resolution regime.
   That is why the device resolution mix exists, and why its weights are labelled
   an assumption.
+
+---
+
+## Week 14: VLM-Specific Serving Policy
+
+### What was measured
+
+The four serving-policy changes the roadmap asked for, each on a week 9 trace,
+each against the policy the project already shipped. Same closed-loop replay,
+same 2B block shape, no forward pass. TTFT is a token-cost clock: every
+scheduled prefill token and every scheduled decode token costs one unit.
+`p99_ttft_cost` is the 99th percentile of that clock at the request's first
+decode token.
+
+Reproduce with `./tools/trace_replay/run_week14.sh`. CSVs:
+`results/week14-pool-sweep.csv`, `week14-chunked-prefill.csv`,
+`week14-size-aware.csv`, `week14-prefix-cache.csv`,
+`week14-image-then-text.csv`.
+
+### Finding 1: decode-aware admission collapses the week-9 preemption thrash
+
+Week 9 admitted on whether the prompt fit and recovered mid-decode in the
+driver. Week 14 admits against `prompt + max_decode_tokens` (minus a usable
+published prefix) and keeps that lifetime as a soft reservation. The scheduler
+still allocates only the prompt; the reservation is what stops a second image
+from taking the blocks the first one will need. `preempt` / `resume` / `cancel`
+are request-scoped, so a fork's private frames come back with the request.
+
+Same image-heavy pool sweep as week 9. Paged vs the week-9 paged column:
+
+| Pool blocks | Week 9 steps | Week 14 steps | Step delta | Week 9 batch | Week 14 batch | Week 9 preempt / failed resume | Week 14 preempt / failed resume |
+| --: | --: | --: | --: | --: | --: | --: | --: |
+| 192 | 22,045 | 27,440 | +24.5% | 3 | 2 | 36 / 1,855 | **0 / 0** |
+| 256 | 14,948 | 20,659 | +38.2% | 4 | 3 | 72 / 3,441 | **0 / 0** |
+| 384 | 10,210 | 11,330 | +11.0% | 5 | 5 | 15 / 273 | **0 / 0** |
+| 512 | 7,127 | 8,368 | +17.4% | 7 | 6 | 56 / 1,047 | **0 / 0** |
+| 768 | 4,842 | 5,372 | +10.9% | 8 | 8 | 13 / 265 | **0 / 0** |
+| 1024 | 4,573 | 4,589 | +0.3% | 8 | 8 | 0 / 0 | **0 / 0** |
+
+Every pool still completes 400 / 400, leak-free, utilization 0.995. Zero
+preemptions at every size, including 256 where week 9 spent 72 parks and 3,441
+failed resumes finishing the same trace.
+
+The cost is packing. A lifetime reservation is larger than a prompt, so the
+batch is smaller and the run is longer. At pool 256 that is 38% more steps and
+peak batch 4 → 3. At pool 1,024 the reservation is not the binding constraint
+and the two policies agree.
+
+Paged still beats the contiguous baseline, but the margin shrinks because the
+baseline was already lifetime-safe. At pool 192 the week-9 paged win was 21%;
+decode-aware leaves 2% (27,440 vs 27,963). The week-9 "paged is faster because
+it over-admits and recovers" story was real, and so is the hang it caused
+without the driver workaround. Decode-aware trades that story for a scheduler
+that can finish without it.
+
+### Finding 2: chunked prefill interleaves work and does not move token-cost TTFT
+
+`max_batch_tokens` now caps both a prefill chunk and the decode tokens added
+after it (the week-6 defect that decode could push a plan over budget). A
+1,292-token image at `max_batch_tokens=256` is six chunks instead of one step.
+`complete_step` subtracts the scheduled chunk from `remaining_prefill_tokens`
+and only then moves the request to Decode.
+
+Bimodal, pool 912 (the week-9 size for that mix), 400 closed-loop requests:
+
+| `max_batch_tokens` | Steps | p99 TTFT cost | Mid-prefill slack | Utilization |
+| --: | --: | --: | --: | --: |
+| 65,536 (one-shot) | 4,452 | 326,527 | 15 | 0.991 |
+| 256 (chunked) | 5,422 (+22%) | 325,249 | **1,296** | 0.974 |
+
+p99 barely moves. Slack jumps because the lifetime reservation still covers
+the whole prompt while only a chunk is committed. That is a real packing
+hole, not a measurement artifact.
+
+The plan's intended pair — bimodal request 1 (1,292-token image) then request 2
+(326-token text), `max_active=2`, pool 256 — is the same number on both sides:
+
+| `max_batch_tokens` | Steps | p99 TTFT cost |
+| --: | --: | --: |
+| 65,536 | 154 | **1,620** |
+| 256 | 160 | **1,620** |
+
+1,620 is `1,292 + 326 + 2`: both prefills, then a two-token decode step that
+records both first tokens. Chunking changes the *order* of that work (the
+text is admitted on step 2, while the image is still mid-prefill) but the
+token-cost clock charges every scheduled token globally. The text's first
+decode still waits until the image's remaining prefill has been scheduled,
+because in-progress prefills fill `max_batch_tokens` before decode is
+considered. Under this cost model, chunking cannot reduce TTFT unless the
+scheduler *skips* image tokens. A wall-clock model with a cheaper 256-token
+step than a 1,618-token step would tell a different story; this replay does
+not have one.
+
+Closed-loop is the other reason the 400-request p99 is "when the last-admitted
+requests produce a first token," not "text sitting behind one image." Arrival
+times are recorded in the trace and still not replayed.
+
+### Finding 3: size-aware admission is a no-op until the pool is the constraint
+
+FIFO remains the default. `--size-aware --skip-limit 8` skips a head that does
+not fit, increments `admission_skips` on the skipped requests, and stops
+skipping a head once it hits the limit. Starvation freedom is a test
+(`SchedulerSizeAwareTest.CannotStarveALargeHead`), not a comment.
+
+Bimodal at the week-9 pool of 912 blocks: FIFO and size-aware are byte-identical
+(4,452 steps, p99 326,527, 3,667 HOL stalls). The head always fits, so the skip
+never fires. That is the honest result on a pool sized for the batch.
+
+The same mix at 256 blocks, where the head sometimes does not fit:
+
+| Policy | Steps | p99 TTFT cost | HOL stall steps | Peak blocks |
+| --- | --: | --: | --: | --: |
+| FIFO | 10,390 | 325,274 | 9,705 | 229 |
+| Size-aware, skip limit 8 | 10,023 (**−3.5%**) | 324,724 | 9,342 | 239 |
+
+A few percent, leak-free, same 400 completions. Not the tail-latency win the
+roadmap hoped for. The bimodal mix's p99 is dominated by late closed-loop
+admits, not by one large head blocking one small request, and decode-aware
+admission already refuses a head whose *lifetime* does not fit — the case
+size-aware would skip is "fits later, not now," which a 256-block pool with
+batch 8 only hits some of the time.
+
+### Finding 4: the prefix index hits, and pinning the published tail costs peak
+
+A content-hash index on `KVCacheManager`: `publish_prefix` pins the published
+frames, `attach_prefix` maps them onto an empty table as non-writable (CoW on
+first write). Same key and a different hash is a collision; `prefix_token_count`
+and `attach` return 0 when more than one record shares the key. Last user
+unpins. Nothing below the cache manager changed.
+
+`repeated-prefix`, pool 912:
+
+| Prefix cache | Steps | Peak blocks | Utilization | Hits | Blocks saved | CoW events |
+| --- | --: | --: | --: | --: | --: | --: |
+| Off | 4,259 | 702 | 0.994 | 0 | 0 | 0 |
+| On | 4,259 | **830** | **1.098** | **232** | **16,606** | 174 |
+
+232 hits on 400 requests is a 58% hit rate on the mix built for this. 16,606
+blocks saved is 72 blocks per hit — about 1,145 tokens, an image prefix, not a
+system-prompt sliver. Utilization above 1 is the sharing signal: committed
+tokens count per mapper, reserved frames count once. Leak-free, including the
+cancel-one-sharer case.
+
+Peak blocks went *up* (702 → 830, +128 frames, +224 MiB). Publish pins the
+whole table, including the partial tail. Decode's first write CoWs that tail,
+so a live published prefix holds the original tail and the copy until the last
+user drops. That is a pin tax, not a leak. Publishing only complete blocks and
+leaving the tail private would remove it; that is not what shipped.
+
+Steps did not change. In closed-loop the work is the same; the win is
+capacity, which this pool was already large enough to hide.
+
+### Verification status
+
+| Check | Status |
+| --- | --- |
+| Existing scheduler tests, or a written update where week-9 behavior was the bug | pass |
+| Decode-aware refuse when prompt fits and prompt+decode does not | pass |
+| Chunked prefill splits a long prompt; `max_batch_tokens` caps decode | pass |
+| Size-aware skip; starvation freedom at `admission_skip_limit` | pass |
+| Prefix share / CoW / collision / cancel-one-sharer / identical attention | pass |
+| Replay with `--prefix-cache` hits and leaves no leaks | pass |
+| Invariant 15 at end of every week-14 CSV row | pass |
+
+### Known limitations of these numbers
+
+- **Token-cost is not wall-clock.** A 256-token step and a 1,618-token step
+  cost their token counts, not their durations. Chunking's TTFT claim is
+  unmeasurable in this model and is recorded as such.
+- **Closed-loop.** Every request is enqueued at step 0. p99 TTFT is dominated
+  by how late a request is admitted under cache pressure, not by one image
+  stalling one text request.
+- **Lifetime reservation is conservative.** It ignores early stop
+  (`decode_actual` vs `decode_budget`), so it over-reserves the same way the
+  contiguous baseline does, which is why the step gap between them shrinks.
+- **Prefix pins include the tail.** Peak cache can rise while allocation-time
+  savings look large. Do not quote 16,606 blocks saved as a peak-memory win.
+- **Size-aware is opt-in and small.** FIFO is still the default. The 3.5%
+  step win needs a pool that actually head-of-line blocks.
 
 ---
 
@@ -1616,8 +1797,8 @@ leftover step of this one.
 
 **Does not need a GPU**
 
-- Week 14 serving policy (trace replay, scheduler)
-- CPU kernel work (weeks 11–12)
+- Week 14 serving policy — done; numbers in this file
+- CPU kernel work (weeks 10–12)
 - Docs, the vLLM comparison, upstream
 - Host swap / CPU reference kernel (already host-only by contract)
 

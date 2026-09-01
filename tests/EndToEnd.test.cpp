@@ -254,7 +254,7 @@ TEST_F(EndToEndTest, PrefillThenDecodeAcrossMultipleActiveRequests) {
         for (TokenPosition position = 0; position < kPromptTokens; ++position) {
             ASSERT_NO_FATAL_FAILURE(check_attention(id, position));
         }
-        scheduler_.complete_step(id, 1);
+        scheduler_.complete_step(id, kPromptTokens);
         EXPECT_EQ(scheduler_.state(id), RequestState::Decode);
     }
 
@@ -320,7 +320,7 @@ TEST_F(EndToEndTest, PreemptedRequestResumesWithIntactCache) {
     for (TokenPosition position = 0; position < kPromptTokens; ++position) {
         ASSERT_NO_FATAL_FAILURE(write_token(1, position));
     }
-    scheduler_.complete_step(1, 1);
+    scheduler_.complete_step(1, kPromptTokens);
 
     const TokenPosition last = kPromptTokens - 1;
     ASSERT_NO_FATAL_FAILURE(check_attention(1, last));

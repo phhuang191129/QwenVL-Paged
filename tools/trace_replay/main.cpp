@@ -27,6 +27,9 @@ void print_usage() {
            "  --swap-slots N           Swap capacity in blocks; 0 disables swap (default 0)\n"
            "  --baseline-max-context N Context the contiguous baseline reserves per\n"
            "                           request (default 8192)\n"
+           "  --size-aware             Enable size-aware admission (default FIFO)\n"
+           "  --skip-limit N           Starvation bound for size-aware admission (default 8)\n"
+           "  --prefix-cache           Share published prompt prefixes across requests\n"
            "  --paged-only             Skip the contiguous baseline\n"
            "  --csv PATH               Append CSV rows to PATH instead of stdout\n";
 }
@@ -63,6 +66,14 @@ int main(int argc, char** argv) {
             paged_only = true;
             continue;
         }
+        if (arg == "--size-aware") {
+            config.size_aware_admission = true;
+            continue;
+        }
+        if (arg == "--prefix-cache") {
+            config.prefix_caching = true;
+            continue;
+        }
         if (!has_value && arg.rfind("--", 0) == 0) {
             std::cerr << "missing value for " << arg << "\n";
             return 2;
@@ -83,6 +94,8 @@ int main(int argc, char** argv) {
             ok = parse_u32(argv[++i], config.swap_slots);
         } else if (arg == "--baseline-max-context") {
             ok = parse_u32(argv[++i], config.baseline_max_context);
+        } else if (arg == "--skip-limit") {
+            ok = parse_u32(argv[++i], config.admission_skip_limit);
         } else if (arg == "--csv") {
             csv_path = argv[++i];
         } else if (arg.rfind("--", 0) == 0) {

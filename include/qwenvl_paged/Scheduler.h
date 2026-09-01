@@ -42,7 +42,28 @@ struct Request {
     SamplingConfig sampling{};
     std::vector<MultimodalSpan> multimodal_spans;
     PositionalEncodingMetadata positional_encoding;
+    /**
+     * @brief Content identity of the shareable prompt prefix, empty if none.
+     */
+    std::string prefix_key;
     RequestState state{RequestState::Pending};
+    /**
+     * @brief Prompt tokens not yet scheduled as prefill work.
+     *
+     * Set to `prompt_tokens` on enqueue. `complete_step` subtracts produced
+     * tokens; the request moves to Decode when this hits zero.
+     */
+    std::uint32_t remaining_prefill_tokens{0};
+    /**
+     * @brief Successful admissions that skipped this request while it was head.
+     *
+     * Used by size-aware admission to bound starvation.
+     */
+    std::uint32_t admission_skips{0};
+    /**
+     * @brief Pool blocks reserved against this request's prompt plus decode.
+     */
+    std::uint32_t lifetime_blocks{0};
 };
 
 /**
@@ -59,6 +80,17 @@ struct SchedulerConfig {
      * `schedule_next`.
      */
     std::uint32_t preemption_watermark_blocks{0};
+    /**
+     * @brief When true, a request that does not fit may be skipped for a smaller
+     *        later one, up to `admission_skip_limit` successful skips.
+     *
+     * The default is strict FIFO so week-9 traces stay reproducible.
+     */
+    bool size_aware_admission{false};
+    /**
+     * @brief How many times a waiting head may be skipped before it blocks again.
+     */
+    std::uint32_t admission_skip_limit{8};
 };
 
 /**
@@ -74,6 +106,10 @@ struct PreemptionInfo {
  */
 struct BatchPlan {
     std::vector<RequestId> prefill_requests;
+    /**
+     * @brief Prefill tokens to run this step, parallel to `prefill_requests`.
+     */
+    std::vector<std::uint32_t> prefill_tokens;
     std::vector<RequestId> decode_requests;
     std::uint32_t scheduled_tokens{0};
 };
@@ -114,17 +150,21 @@ public:
     /**
      * @brief Builds the next batch plan and updates request states.
      *
-     * A pending request is only admitted when the cache manager can actually
-     * reserve its prompt. Under cache pressure the request stays pending and no
-     * sequence state is left behind, so a later step can admit it once blocks
-     * are reclaimed.
+     * A pending request is only admitted when the cache manager can reserve its
+     * prompt and the pool can still cover that prompt plus the request's decode
+     * budget. Under cache pressure the request stays pending and no sequence
+     * state is left behind, so a later step can admit it once blocks are
+     * reclaimed.
+     *
+     * Prefill longer than the remaining `max_batch_tokens` is split across
+     * steps. Decode tokens count against the same budget.
      *
      * When `SchedulerConfig::preemption_watermark_blocks` is positive, the
      * scheduler also reclaims cache on its own before admitting: it preempts
-     * active requests, newest first, until the candidate's prompt plus the
-     * configured reserve fits. The newest request is chosen because the oldest
-     * is closest to finishing. The policy is demand-driven, so nothing is
-     * preempted while no request is waiting.
+     * active requests, newest first, until the candidate's prompt-plus-decode
+     * plus the configured reserve fits. The newest request is chosen because
+     * the oldest is closest to finishing. The policy is demand-driven, so
+     * nothing is preempted while no request is waiting.
      */
     [[nodiscard]] BatchPlan schedule_next();
 
@@ -141,9 +181,9 @@ public:
     /**
      * @brief Preempts a request when cache pressure requires it.
      *
-     * The request's cache is swapped out so its frames become available to other
-     * requests, and the reason plus the number of reclaimed blocks are recorded
-     * as preemption metadata.
+     * Every sequence of the request is swapped out, so private sampling-branch
+     * frames reclaim. Shared prompt frames stay, by the existing swap_out
+     * refcount rule.
      */
     bool preempt(RequestId request_id, std::string reason);
 
@@ -177,17 +217,33 @@ private:
     [[nodiscard]] std::uint32_t blocks_for_tokens(std::uint32_t token_count) const noexcept;
 
     /**
-     * @brief Preempts active requests until a prompt plus the reserve fits.
+     * @brief Preempts active requests until a prompt-plus-decode plus reserve fits.
      *
      * `admitted_this_step` is the number of requests already admitted by the
      * current `schedule_next` call. Those sit at the back of the active queue
      * and are excluded from victim selection, so a batch plan can never contain
      * a request that the same call went on to preempt.
      *
-     * Does nothing when the policy is disabled, when the prompt already fits, or
-     * when no amount of preemption could help.
+     * Does nothing when the policy is disabled, when the request already fits,
+     * or when no amount of preemption could help.
      */
-    void reclaim_for_admission(std::uint32_t prompt_tokens, std::size_t admitted_this_step);
+    void reclaim_for_admission(
+        std::uint32_t prompt_tokens,
+        std::uint32_t decode_tokens,
+        std::size_t admitted_this_step);
+
+    /**
+     * @brief Blocks reserved against prompt plus decode, minus a published prefix.
+     */
+    [[nodiscard]] std::uint32_t lifetime_blocks_for(const Request& request) const noexcept;
+
+    /**
+     * @brief Tries to admit `candidate` into `plan`. On success the caller pops it.
+     */
+    bool try_admit(Request& candidate, BatchPlan& plan, std::size_t admitted_this_step);
+
+    void schedule_prefill_chunk(Request& request, BatchPlan& plan);
+    void schedule_decode_tokens(BatchPlan& plan);
 
     SchedulerConfig config_{};
     KVCacheManager* cache_manager_{nullptr};
@@ -196,6 +252,7 @@ private:
     std::deque<Request> active_;
     std::deque<Request> preempted_;
     std::unordered_map<RequestId, PreemptionInfo> preemption_info_;
+    std::uint32_t lifetime_held_{0};
 };
 
 } // namespace qwenvl_paged

@@ -599,8 +599,10 @@ readmission. The failure path leaves the world exactly as it found it.
 
 Also note that every failure `break`s rather than `continue`s. This is strict
 FIFO with head-of-line blocking: a request that does not fit stops the whole
-admission loop rather than letting smaller requests jump the queue. That is a
-simplicity/fairness choice, not an oversight; see [§6.10](#610-strict-fifo-with-head-of-line-blocking).
+admission loop rather than letting smaller requests jump the queue. That is
+still the default. Week 14 added decode-aware lifetime admission, chunked
+prefill, and an opt-in size-aware skip; the snippet above is the week-6
+baseline. See [§6.10](#610-strict-fifo-is-the-default-size-aware-is-opt-in).
 
 Second, it appends every active request already in `Decode` state, one token
 each. Requests admitted this step are in `Prefill` state, so they cannot appear
@@ -998,16 +1000,21 @@ one at the call site. The function's contract is binary: fully correct, or
 `false` and untouched. This matters most under preemption, where a block can
 legitimately be missing.
 
-### 6.10 Strict FIFO with head-of-line blocking
+### 6.10 Strict FIFO is the default; size-aware is opt-in
 
-`schedule_next` `break`s out of the admission loop on any failure rather than
-skipping the candidate.
+`schedule_next` still `break`s out of the admission loop on any failure when
+`SchedulerConfig::size_aware_admission` is false (the default). With it on, a
+head that does not fit is skipped, each skip increments `admission_skips` on
+the passed-over requests, and a head that hits `admission_skip_limit` blocks
+again.
 
-**Why:** it guarantees no starvation — a large request cannot be indefinitely
-skipped in favor of small ones. The cost is throughput: a 4,000-token prompt at
-the head of the queue stalls a 10-token prompt behind it. A production scheduler
-would add priorities or a size-aware policy; this is the honest, simple baseline
-that the more complex policy has to beat.
+**Why FIFO stays the default:** it guarantees no starvation without a skip
+counter, and it is the baseline week 14 had to beat. On a pool sized for the
+batch, size-aware never fires. Under cache pressure it saved 3.5% of steps on
+the bimodal trace and did not move p99 TTFT. The more complex policy is
+available and has a starvation-freedom test; it is not the default because the
+measured win is small and the fairness argument is the one that needed
+proving.
 
 ### 6.11 Preempt the *newest* active request
 
@@ -1115,18 +1122,21 @@ design itself.
 
 **Intentional scope boundaries**
 
-- **No GPU backend.** The integration points are specified (host allocation
-  behind a deleter, flattenable block tables, layout strides, `copy_block` as a
-  future `cudaMemcpyAsync`, `SwapBackend` as device-to-host migration) but
-  nothing is implemented.
+- **The GPU backend exists.** Weeks 15–23 shipped a Triton decode kernel, a
+  device-resident pool, and copy-on-write through `set_copy_hook`. What is
+  still not built is a Triton *prefill* kernel, a fused batch in the Hugging
+  Face generate path, quantized KV, device-aware swap, and CUDA graphs. Those
+  are a new GPU session, not leftovers; see [`performance.md`](performance.md)
+  "GPU Session Closed".
 - **The CPU kernel is a correctness reference only.** No blocking, no
   vectorization, no online softmax, and it heap-allocates two pointer vectors per
   call. Its runtime is not a meaningful baseline, which the README states
-  explicitly.
-- **No prefix caching across requests.** The sharing machinery (refcounts, CoW)
-  is fully general, but only `fork_sequence` uses it. A content-hash index that
-  let two *different* requests share an identical system prompt would be a
-  natural next feature and would need no changes below `KVCacheManager`.
+  explicitly. Weeks 10–12 are the work that changes this.
+- **Prefix caching across requests exists.** `publish_prefix` / `attach_prefix`
+  are a content-hash index on `KVCacheManager`. The sharing machinery
+  (refcounts, CoW) did not need changes below that layer, which is the
+  walkthrough claim week 14 tested. Collision and cancel-one-sharer are
+  tests, not comments.
 - **Single cache stream.** `CacheKind` distinguishes `TextKV`, `VisionKV`,
   `RopeState`, and `Auxiliary`, but `KVCacheManager` holds one `text_table` per
   sequence and `ensure_token_writable` ignores the argument.
@@ -1136,14 +1146,16 @@ design itself.
 - `reserve_tokens` rounds up per call and always appends, so it cannot fill a
   partially used tail block. Callers must guard on
   `position / tokens_per_block >= table.size()`, as the end-to-end test does.
-- `complete_step` only performs the `Prefill → Decode` transition. It ignores
-  `produced_tokens`, never enforces `max_decode_tokens`, and never moves a
-  request to `Finished` — completion is entirely caller-driven via `cancel`.
+- `complete_step` subtracts `produced_tokens` from `remaining_prefill_tokens`
+  and moves Prefill → Decode when that hits zero. It still never enforces
+  `max_decode_tokens` and never moves a request to `Finished` — completion is
+  entirely caller-driven via `cancel`.
 - Nothing auto-resumes a preempted request. `reclaim_for_admission` preempts
   automatically, but `resume` must be called explicitly, so a naive loop can park
   a request forever.
-- `max_batch_tokens` is only enforced during admission. Decode tokens are added
-  to `scheduled_tokens` afterwards and can push a plan over the budget.
+- `max_batch_tokens` now caps both prefill chunks and decode tokens. Prefill is
+  still scheduled first, so a full prefill chunk can starve decode in the same
+  step; that is why chunking did not move token-cost TTFT.
 - `stats()` is O(total_blocks) and is called two to three times per iteration of
   the preemption loop. Fine at 128 blocks, wasteful at 10,000; incremental
   counters would fix it.
@@ -1229,9 +1241,11 @@ ordering: a frame may not be recycled while a kernel still reads it, so
 `release`, `swap_out`, and `preempt` must wait on the step's completion event.
 
 **"What would you do next?"**
-Cross-request prefix caching. The sharing machinery is already general — a
-content-hash index over blocks would let two different requests share an
-identical system prompt, and it needs no changes below `KVCacheManager`. For
-production workloads with long shared system prompts, that is a larger win than
-anything in the scheduler.
+Weeks 10–12: a measured CPU roofline, then make the reference kernel fast
+enough to sit on it. Prefix caching and the GPU decode path are already
+shipped; the remaining CPU gap is that the kernel is still a correctness
+reference. For production serving the next scheduler lever is publishing
+only complete prefix blocks (the pin+CoW tail currently *raises* peak
+cache) and a cost model that can see chunking's wall-clock TTFT, which
+the token-cost replay cannot.
 

@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -231,6 +232,54 @@ public:
     void release_sequence(SequenceId sequence_id);
 
     /**
+     * @brief Returns every sequence created or forked under this request.
+     */
+    [[nodiscard]] std::vector<SequenceId> sequences_for(RequestId request_id) const;
+
+    /**
+     * @brief Swaps out every sequence of a request.
+     *
+     * Shared frames (refcount != 1) are skipped by the existing swap_out rule,
+     * so a forked prompt stays resident while private branch blocks reclaim.
+     */
+    std::uint32_t swap_out_request(RequestId request_id);
+
+    /**
+     * @brief Restores every swapped sequence of a request, all-or-nothing.
+     */
+    bool swap_in_request(RequestId request_id);
+
+    /**
+     * @brief Releases every sequence of a request.
+     */
+    void release_request(RequestId request_id);
+
+    /**
+     * @brief How many prompt tokens a unique prefix record currently covers.
+     *
+     * Zero when the key is unknown or when two different contents collided on
+     * the same key, so a caller must not share.
+     */
+    [[nodiscard]] std::uint32_t prefix_token_count(const std::string& key) const;
+
+    /**
+     * @brief Indexes this sequence's resident blocks under `key`.
+     *
+     * Pins the frames so they survive the publisher being released while
+     * another request is still attached. A second publish of the same key with
+     * different contents is recorded as a collision rather than a replacement.
+     */
+    bool publish_prefix(SequenceId sequence_id, const std::string& key);
+
+    /**
+     * @brief Maps a published prefix onto an empty sequence, retaining each frame.
+     *
+     * Returns the token count covered, or 0 on miss / collision. Mapped blocks
+     * are not writable; the first write copy-on-writes as usual.
+     */
+    std::uint32_t attach_prefix(SequenceId sequence_id, const std::string& key);
+
+    /**
      * @brief Returns a backend-facing cache view for a sequence.
      */
     [[nodiscard]] std::optional<CacheView> cache_view(
@@ -246,10 +295,27 @@ private:
     struct SequenceState {
         SequenceMetadata metadata{};
         BlockTable text_table;
+        std::string prefix_key;
+        std::uint64_t prefix_hash{0};
     };
+
+    struct PrefixRecord {
+        std::uint64_t content_hash{0};
+        std::uint32_t token_count{0};
+        std::uint32_t users{0};
+        std::vector<PhysicalBlockId> physical_ids;
+    };
+
+    void index_sequence(RequestId request_id, SequenceId sequence_id);
+    void unindex_sequence(RequestId request_id, SequenceId sequence_id);
+    void drop_prefix_user(SequenceState& state);
+    [[nodiscard]] std::uint32_t tokens_per_block() const noexcept;
+    [[nodiscard]] std::uint64_t content_hash_of(const BlockTable& table) const;
 
     MemoryAllocator* allocator_{nullptr};
     std::unordered_map<SequenceId, SequenceState> sequences_;
+    std::unordered_map<RequestId, std::vector<SequenceId>> sequences_by_request_;
+    std::unordered_map<std::string, std::vector<PrefixRecord>> prefix_index_;
 };
 
 } // namespace qwenvl_paged

@@ -91,6 +91,9 @@ struct ReplayConfig {
     std::uint32_t max_batch_tokens{32768};
     std::uint32_t preemption_watermark_blocks{0};
     std::uint32_t swap_slots{0};
+    bool size_aware_admission{false};
+    std::uint32_t admission_skip_limit{8};
+    bool prefix_caching{false};
     /**
      * @brief Upper bound on what the contiguous baseline reserves per request.
      *
@@ -135,6 +138,15 @@ struct ReplayMetrics {
     std::uint64_t swapped_blocks_out{0};
     std::uint64_t forks{0};
     std::uint64_t cow_events{0};
+    std::uint64_t prefix_hits{0};
+    std::uint64_t prefix_blocks_saved{0};
+    /**
+     * @brief 99th percentile time-to-first-token in token-cost units.
+     *
+     * One scheduled prefill token and one decode token each cost 1. There is no
+     * wall clock in this replay.
+     */
+    std::uint64_t p99_ttft_cost{0};
 
     /** @brief Steps where a request was waiting and none could be admitted. */
     std::uint64_t head_of_line_stall_steps{0};
@@ -167,12 +179,9 @@ struct ReplayMetrics {
 /**
  * @brief Smallest pool that lets `max_active_requests` run without exhaustion.
  *
- * The scheduler admits on whether a *prompt* fits, not whether the prompt plus
- * the decode budget fits, so a pool smaller than this can admit a batch it
- * cannot carry to completion. With automatic preemption disabled that is a
- * permanent stall rather than a slowdown, which `run_paged` reports instead of
- * hiding. Sizing the pool from the workload is the week 9 answer; making
- * admission itself decode-aware is a week 14 change.
+ * The scheduler now admits against prompt plus decode budget. This helper still
+ * sizes a pool that can hold `max_active_requests` worst-case requests so the
+ * week-9 mix comparison isolates packing from scheduling.
  */
 [[nodiscard]] std::uint32_t suggested_pool_blocks(const Trace& trace, const ReplayConfig& config);
 

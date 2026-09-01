@@ -161,6 +161,20 @@ TEST(TraceReplay, ForkingSharesPromptBlocksAcrossSamplingBranches) {
     EXPECT_TRUE(metrics.leak_free);
 }
 
+TEST(TraceReplay, PrefixCacheHitsOnRepeatedPrefixAndLeavesNoLeaks) {
+    const Trace trace = load_or_fail("repeated-prefix.jsonl");
+    ASSERT_FALSE(trace.requests.empty());
+
+    ReplayConfig config = config_for(trace);
+    config.prefix_caching = true;
+
+    const ReplayMetrics metrics = run_paged(trace, config);
+    ASSERT_TRUE(metrics.completed);
+    EXPECT_TRUE(metrics.leak_free);
+    EXPECT_GT(metrics.prefix_hits, 0U);
+    EXPECT_GT(metrics.prefix_blocks_saved, 0U);
+}
+
 TEST(TraceReplay, ReportsStallInsteadOfHangingWhenAPromptCannotFit) {
     const Trace trace = load_or_fail("bimodal-default-budget.jsonl");
     ASSERT_FALSE(trace.requests.empty());

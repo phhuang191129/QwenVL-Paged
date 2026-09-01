@@ -11,6 +11,8 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
+#include <vector>
 
 namespace qwenvl_paged::replay {
 
@@ -113,6 +115,7 @@ struct RequestProgress {
     std::vector<SequenceId> sequences;
     std::uint32_t committed{0};
     std::uint32_t decoded{0};
+    std::uint32_t shared_prompt_tokens{0};
     bool admitted{false};
     bool finished{false};
 };
@@ -273,13 +276,13 @@ ReplayMetrics run_paged(const Trace& trace, const ReplayConfig& config) {
         allocator.set_swap_backend(&swap);
     }
     KVCacheManager cache(allocator);
-    Scheduler scheduler(
-        SchedulerConfig{
-            config.max_active_requests,
-            config.max_batch_tokens,
-            config.preemption_watermark_blocks},
-        cache,
-        allocator);
+    SchedulerConfig sched_cfg;
+    sched_cfg.max_active_requests = config.max_active_requests;
+    sched_cfg.max_batch_tokens = config.max_batch_tokens;
+    sched_cfg.preemption_watermark_blocks = config.preemption_watermark_blocks;
+    sched_cfg.size_aware_admission = config.size_aware_admission;
+    sched_cfg.admission_skip_limit = config.admission_skip_limit;
+    Scheduler scheduler(sched_cfg, cache, allocator);
 
     const std::size_t block_bytes = allocator_config.block_shape.byte_size();
 
@@ -293,8 +296,8 @@ ReplayMetrics run_paged(const Trace& trace, const ReplayConfig& config) {
         index_of[request.request_id] = i;
         next_fork_sequence = std::max<SequenceId>(next_fork_sequence, request.request_id + 1);
 
-        if (ceil_div(request.prompt_tokens, tokens_per_block) > config.max_blocks ||
-            request.prompt_tokens > config.max_batch_tokens) {
+        if (ceil_div(request.prompt_tokens + request.decode_budget, tokens_per_block) >
+            config.max_blocks) {
             ++metrics.requests_never_admissible;
         }
 
@@ -306,6 +309,9 @@ ReplayMetrics run_paged(const Trace& trace, const ReplayConfig& config) {
         scheduled.sampling.max_decode_tokens = request.decode_budget;
         scheduled.multimodal_spans = request.multimodal_spans;
         scheduled.positional_encoding = request.positional_encoding;
+        if (config.prefix_caching) {
+            scheduled.prefix_key = request.prefix_key;
+        }
         scheduler.enqueue(std::move(scheduled));
     }
 
@@ -314,6 +320,8 @@ ReplayMetrics run_paged(const Trace& trace, const ReplayConfig& config) {
     std::vector<RequestId> live;                  // admitted and unfinished, in admission order
     std::unordered_set<RequestId> preempted_ids;  // parked as of the previous step
     std::uint32_t no_progress_steps = 0;
+    std::uint64_t token_cost = 0;
+    std::vector<std::uint64_t> ttfts;
 
     while (completed < trace.requests.size() && metrics.steps < config.max_steps) {
         const BatchPlan plan = scheduler.schedule_next();
@@ -346,36 +354,58 @@ ReplayMetrics run_paged(const Trace& trace, const ReplayConfig& config) {
             return false;
         };
 
-        for (const RequestId id : plan.prefill_requests) {
+        for (std::size_t i = 0; i < plan.prefill_requests.size(); ++i) {
+            const RequestId id = plan.prefill_requests[i];
+            const std::uint32_t chunk = plan.prefill_tokens[i];
             RequestProgress& state = progress[index_of.at(id)];
             const TraceRequest& request = *state.request;
 
-            state.admitted = true;
-            state.sequences.push_back(request.request_id);
-            ++metrics.requests_admitted;
-            --waiting;
-            live.push_back(id);
-
-            for (std::uint32_t block = 0; block * tokens_per_block < request.prompt_tokens; ++block) {
-                touch_position(cache, request.request_id, block * tokens_per_block, tokens_per_block, metrics);
-            }
-
-            // Parallel sampling branches share the prompt until one of them writes.
-            for (std::uint32_t branch = 1; branch < request.num_parallel_samples; ++branch) {
-                SequenceMetadata child;
-                child.sequence_id = next_fork_sequence++;
-                child.request_id = request.request_id;
-                child.multimodal_spans = request.multimodal_spans;
-                child.positional_encoding = request.positional_encoding;
-                if (cache.fork_sequence(request.request_id, child)) {
-                    state.sequences.push_back(child.sequence_id);
-                    ++metrics.forks;
+            if (!state.admitted) {
+                state.admitted = true;
+                state.sequences.push_back(request.request_id);
+                ++metrics.requests_admitted;
+                --waiting;
+                live.push_back(id);
+                if (config.prefix_caching && !request.prefix_key.empty()) {
+                    const std::uint32_t cached = cache.prefix_token_count(request.prefix_key);
+                    if (cached > 0) {
+                        state.shared_prompt_tokens = cached;
+                        ++metrics.prefix_hits;
+                        metrics.prefix_blocks_saved += cached / tokens_per_block;
+                    }
                 }
             }
 
-            state.committed = request.prompt_tokens;
-            scheduler.complete_step(id, request.prompt_tokens);
+            for (std::uint32_t offset = 0; offset < chunk; ++offset) {
+                const TokenPosition position = state.committed + offset;
+                if (position < state.shared_prompt_tokens) {
+                    continue;
+                }
+                if (position % tokens_per_block == 0) {
+                    touch_position(cache, request.request_id, position, tokens_per_block, metrics);
+                }
+            }
+
+            state.committed += chunk;
+            scheduler.complete_step(id, chunk);
             progress_made = true;
+
+            if (scheduler.state(id) == qwenvl_paged::RequestState::Decode) {
+                if (config.prefix_caching && !request.prefix_key.empty()) {
+                    static_cast<void>(cache.publish_prefix(request.request_id, request.prefix_key));
+                }
+                for (std::uint32_t branch = 1; branch < request.num_parallel_samples; ++branch) {
+                    SequenceMetadata child;
+                    child.sequence_id = next_fork_sequence++;
+                    child.request_id = request.request_id;
+                    child.multimodal_spans = request.multimodal_spans;
+                    child.positional_encoding = request.positional_encoding;
+                    if (cache.fork_sequence(request.request_id, child)) {
+                        state.sequences.push_back(child.sequence_id);
+                        ++metrics.forks;
+                    }
+                }
+            }
         }
 
         bool growth_failed = false;
@@ -415,11 +445,11 @@ ReplayMetrics run_paged(const Trace& trace, const ReplayConfig& config) {
             scheduler.complete_step(id, 1);
             progress_made = true;
 
+            if (state.decoded == 1) {
+                ttfts.push_back(token_cost + plan.scheduled_tokens);
+            }
+
             if (state.decoded >= state.request->decode_actual) {
-                // The scheduler releases the root sequence; forks are the driver's.
-                for (std::size_t branch = 1; branch < state.sequences.size(); ++branch) {
-                    cache.release_sequence(state.sequences[branch]);
-                }
                 scheduler.cancel(id);
                 state.finished = true;
                 state.sequences.clear();
@@ -469,6 +499,8 @@ ReplayMetrics run_paged(const Trace& trace, const ReplayConfig& config) {
                 [&](RequestId id) { return progress[index_of.at(id)].finished; }),
             live.end());
 
+        token_cost += plan.scheduled_tokens;
+
         if (waiting > 0 && plan.prefill_requests.empty()) {
             ++metrics.head_of_line_stall_steps;
         }
@@ -506,6 +538,13 @@ ReplayMetrics run_paged(const Trace& trace, const ReplayConfig& config) {
             // Nothing changed and nothing can: the trace is permanently stalled.
             break;
         }
+    }
+
+    if (!ttfts.empty()) {
+        std::sort(ttfts.begin(), ttfts.end());
+        const std::size_t index =
+            static_cast<std::size_t>(0.99 * static_cast<double>(ttfts.size() - 1));
+        metrics.p99_ttft_cost = ttfts[index];
     }
 
     metrics.requests_completed = static_cast<std::uint32_t>(completed);
@@ -671,6 +710,7 @@ std::string csv_header() {
            "peak_active_requests,peak_blocks_in_use,peak_bytes_in_use,utilization,"
            "max_partial_block_slack,"
            "preemptions,resumes,failed_resumes,swapped_blocks_out,forks,cow_events,"
+           "prefix_hits,prefix_blocks_saved,p99_ttft_cost,size_aware,prefix_caching,"
            "head_of_line_stall_steps,fragmentation_failures,completed,leak_free";
 }
 
@@ -688,6 +728,9 @@ std::string to_csv_row(const Trace& trace, const ReplayConfig& config, const Rep
         << metrics.utilization() << ',' << metrics.max_partial_block_slack << ','
         << metrics.preemptions << ',' << metrics.resumes << ',' << metrics.failed_resumes << ','
         << metrics.swapped_blocks_out << ',' << metrics.forks << ',' << metrics.cow_events << ','
+        << metrics.prefix_hits << ',' << metrics.prefix_blocks_saved << ','
+        << metrics.p99_ttft_cost << ',' << (config.size_aware_admission ? 1 : 0) << ','
+        << (config.prefix_caching ? 1 : 0) << ','
         << metrics.head_of_line_stall_steps << ',' << metrics.fragmentation_failures << ','
         << (metrics.completed ? 1 : 0) << ',' << (metrics.leak_free ? 1 : 0);
     return row.str();
