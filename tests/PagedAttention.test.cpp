@@ -494,6 +494,54 @@ TEST(PagedAttentionTest, MatchesContiguousReferenceOnScatteredBlocks) {
     }
 }
 
+TEST(PagedAttentionTest, BlockedAgreesWithReferenceOnScatteredBlocks) {
+    constexpr std::uint32_t kTokensPerBlock = 4;
+    constexpr std::uint32_t kNumLayers = 2;
+    constexpr std::uint32_t kNumKvHeads = 2;
+    constexpr std::uint32_t kHeadDim = 4;
+    constexpr std::uint32_t kContext = 10;
+
+    Harness harness(make_shape(kTokensPerBlock, kNumLayers, kNumKvHeads, kHeadDim), 12);
+    ASSERT_TRUE(harness.cache.create_sequence(SequenceMetadata{1, 1, {}, {}}));
+    reserve_scattered(harness, 1, 99, 3);
+    ASSERT_TRUE(populate_pattern(harness, 1, kContext));
+
+    const std::optional<CacheView> view = harness.cache.cache_view(1);
+    ASSERT_TRUE(view.has_value());
+    ASSERT_TRUE(is_physically_scattered(*view->block_table));
+
+    std::vector<float> query(static_cast<std::size_t>(kNumKvHeads) * kHeadDim);
+    for (std::size_t i = 0; i < query.size(); ++i) {
+        query[i] = 0.25F * static_cast<float>(i) - 0.5F;
+    }
+
+    for (std::uint32_t layer = 0; layer < kNumLayers; ++layer) {
+        std::vector<float> reference(query.size(), 0.0F);
+        std::vector<float> blocked(query.size(), 0.0F);
+        ASSERT_TRUE(paged_attention_decode<float>(
+            *view, query.data(), make_params(layer, kNumKvHeads, kContext, 0.5F), reference.data()));
+        ASSERT_TRUE(paged_attention_decode_blocked<float>(
+            *view, query.data(), make_params(layer, kNumKvHeads, kContext, 0.5F), blocked.data()));
+        for (std::size_t i = 0; i < reference.size(); ++i) {
+            EXPECT_NEAR(blocked[i], reference[i], kTolerance)
+                << "layer " << layer << " element " << i;
+        }
+
+        std::vector<float> fused(query.size(), 0.0F);
+        std::vector<float> fast(query.size(), 0.0F);
+        ASSERT_TRUE(paged_attention_decode_fused<float>(
+            *view, query.data(), make_params(layer, kNumKvHeads, kContext, 0.5F), fused.data()));
+        ASSERT_TRUE(paged_attention_decode_fast<float>(
+            *view, query.data(), make_params(layer, kNumKvHeads, kContext, 0.5F), fast.data()));
+        for (std::size_t i = 0; i < reference.size(); ++i) {
+            EXPECT_NEAR(fused[i], reference[i], kTolerance)
+                << "fused layer " << layer << " element " << i;
+            EXPECT_NEAR(fast[i], reference[i], 1e-4F)
+                << "fast layer " << layer << " element " << i;
+        }
+    }
+}
+
 TEST(PagedAttentionTest, GroupedQueryHeadsReadTheirOwnKvHead) {
     constexpr std::uint32_t kHeadDim = 4;
     constexpr std::uint32_t kNumKvHeads = 2;
@@ -524,10 +572,21 @@ TEST(PagedAttentionTest, GroupedQueryHeadsReadTheirOwnKvHead) {
     ASSERT_TRUE(paged_attention_decode<float>(
         *view, query.data(), make_params(0, kNumQueryHeads, kContext, 1.0F), out.data()));
 
+    std::vector<float> fused(query.size(), 0.0F);
+    std::vector<float> fast(query.size(), 0.0F);
+    ASSERT_TRUE(paged_attention_decode_fused<float>(
+        *view, query.data(), make_params(0, kNumQueryHeads, kContext, 1.0F), fused.data()));
+    ASSERT_TRUE(paged_attention_decode_fast<float>(
+        *view, query.data(), make_params(0, kNumQueryHeads, kContext, 1.0F), fast.data()));
+
     for (std::uint32_t q_head = 0; q_head < kNumQueryHeads; ++q_head) {
         const float expected = kv_head_value[q_head / (kNumQueryHeads / kNumKvHeads)];
         for (std::uint32_t dim = 0; dim < kHeadDim; ++dim) {
             EXPECT_NEAR(out[q_head * kHeadDim + dim], expected, kTolerance) << "query head " << q_head;
+            EXPECT_NEAR(fused[q_head * kHeadDim + dim], expected, kTolerance)
+                << "fused query head " << q_head;
+            EXPECT_NEAR(fast[q_head * kHeadDim + dim], expected, 1e-4F)
+                << "fast query head " << q_head;
         }
     }
 }

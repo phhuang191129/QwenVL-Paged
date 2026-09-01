@@ -1241,9 +1241,9 @@ ordering: a frame may not be recycled while a kernel still reads it, so
 `release`, `swap_out`, and `preempt` must wait on the step's completion event.
 
 **"What would you do next?"**
-Weeks 11–12: make the reference kernel chase the 35 GB/s DRAM roof week 10
-measured, and fuse the GQA group (the only AI lever that is not
-quantization). Prefix caching, the GPU decode path, and the roofline are
-already shipped. Do not chase the paper FMA peak; at AI = 1.0 the compute
-roof is already above DRAM.
+The CPU decode kernel is 2.4–3.0× the scalar oracle and still 4–11× under
+the 35 GB/s DRAM roof. The isolated paging tax at image length is 2.43×
+(stride inside a 1.75 MiB block, not the page walk). Week 12's thread pool
+stays closed until one thread is near that roof. A layer-major store layout
+would remove the tax without touching the allocator.
 

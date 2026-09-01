@@ -199,12 +199,19 @@ protected:
             ASSERT_TRUE(paged_attention_decode<float>(*view, query.data(), params, out.data()))
                 << "sequence " << sequence_id << " position " << position << " layer " << layer;
 
+            std::vector<float> fast(query.size(), 0.0F);
+            ASSERT_TRUE(paged_attention_decode_fast<float>(*view, query.data(), params, fast.data()))
+                << "fast sequence " << sequence_id << " position " << position << " layer " << layer;
+
             const std::vector<float> expected =
                 reference_attention(sequence_id, query, layer, context_len);
             for (std::size_t i = 0; i < out.size(); ++i) {
                 EXPECT_NEAR(out[i], expected[i], kTolerance)
                     << "sequence " << sequence_id << " position " << position << " layer " << layer
                     << " element " << i;
+                EXPECT_NEAR(fast[i], out[i], 1e-4F)
+                    << "fast sequence " << sequence_id << " position " << position << " layer "
+                    << layer << " element " << i;
             }
         }
     }

@@ -342,26 +342,45 @@ void bench_attention(Csv& csv) {
         params.context_len = context;
         params.scale = 1.0F / std::sqrt(static_cast<float>(shape.head_dim));
 
-        const auto stats = qwenvl_bench::measure_body(
-            [&]() {
-                if (!qwenvl_paged::paged_attention_decode<std::uint16_t>(*view, query.data(), params, out.data())) {
-                    std::cerr << "paged_attention_decode failed\n";
-                    std::exit(1);
-                }
-            },
-            kWarmup,
-            kRepeats);
-
-        const double bytes = static_cast<double>(q_heads) * 2.0 * context * shape.head_dim *
+        const double bytes_unfused = static_cast<double>(q_heads) * 2.0 * context * shape.head_dim *
             shape.bytes_per_element;
+        const double bytes_fused = static_cast<double>(shape.num_kv_heads) * 2.0 * context *
+            shape.head_dim * shape.bytes_per_element;
         const double flops = static_cast<double>(q_heads) * 4.0 * shape.head_dim * context;
-        csv.row(
-            "attention_decode",
+
+        const auto time_kernel = [&](auto kernel, std::string name, double bytes, const char* notes) {
+            const auto stats = qwenvl_bench::measure_body(
+                [&]() {
+                    if (!kernel(*view, query.data(), params, out.data())) {
+                        std::cerr << name << " failed\n";
+                        std::exit(1);
+                    }
+                },
+                kWarmup,
+                kRepeats);
+            csv.row("attention_decode", name, bytes, flops, stats, notes);
+        };
+
+        time_kernel(
+            qwenvl_paged::paged_attention_decode<std::uint16_t>,
             "decode ctx " + std::to_string(context),
-            bytes,
-            flops,
-            stats,
-            "unfused GQA, one layer, 2B shape");
+            bytes_unfused,
+            "reference, unfused");
+        time_kernel(
+            qwenvl_paged::paged_attention_decode_blocked<std::uint16_t>,
+            "blocked ctx " + std::to_string(context),
+            bytes_unfused,
+            "block-at-a-time");
+        time_kernel(
+            qwenvl_paged::paged_attention_decode_fused<std::uint16_t>,
+            "fused ctx " + std::to_string(context),
+            bytes_fused,
+            "GQA fusion, two-pass");
+        time_kernel(
+            qwenvl_paged::paged_attention_decode_fast<std::uint16_t>,
+            "fast ctx " + std::to_string(context),
+            bytes_fused,
+            "fusion + online softmax + AVX-512");
     }
 
     // Prefill is this kernel at every prefix length. S=256 is long enough to
@@ -396,18 +415,64 @@ void bench_attention(Csv& csv) {
         prefill_flops,
         prefill_stats,
         "S independent decode calls; GEMM AI is higher");
+
+    BlockShape packed = shape;
+    packed.num_layers = 1;
+    AllocatorConfig packed_config;
+    packed_config.block_shape = packed;
+    packed_config.max_blocks = needed_blocks;
+    MemoryAllocator packed_allocator(packed_config);
+    KVCacheManager packed_cache(packed_allocator);
+    KVBlockLayout packed_layout;
+    packed_layout.shape = packed;
+    if (!fill_sequence(packed_cache, packed_allocator, packed_layout, 1, 1280)) {
+        std::cerr << "failed to populate packed attention cache\n";
+        return;
+    }
+    const std::optional<CacheView> packed_view = packed_cache.cache_view(1);
+    if (!packed_view.has_value()) {
+        return;
+    }
+    PagedAttentionParams packed_params;
+    packed_params.layer = 0;
+    packed_params.num_query_heads = q_heads;
+    packed_params.context_len = 1280;
+    packed_params.scale = 1.0F / std::sqrt(static_cast<float>(shape.head_dim));
+    const auto packed_stats = qwenvl_bench::measure_body(
+        [&]() {
+            if (!qwenvl_paged::paged_attention_decode_fast<std::uint16_t>(
+                    *packed_view, query.data(), packed_params, out.data())) {
+                std::cerr << "packed fast decode failed\n";
+                std::exit(1);
+            }
+        },
+        kWarmup,
+        kRepeats);
+    const double packed_bytes = static_cast<double>(shape.num_kv_heads) * 2.0 * 1280 *
+        shape.head_dim * shape.bytes_per_element;
+    const double packed_flops = static_cast<double>(q_heads) * 4.0 * shape.head_dim * 1280;
+    csv.row(
+        "attention_decode",
+        "fast ctx 1280 packed",
+        packed_bytes,
+        packed_flops,
+        packed_stats,
+        "1-layer frames; paging tax vs fast ctx 1280");
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
     std::string csv_path = "results/week10-roofs.csv";
+    bool attention_only = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--csv" && i + 1 < argc) {
             csv_path = argv[++i];
+        } else if (arg == "--attention") {
+            attention_only = true;
         } else {
-            std::cerr << "usage: qwenvl_roofline [--csv path]\n";
+            std::cerr << "usage: qwenvl_roofline [--csv path] [--attention]\n";
             return 2;
         }
     }
@@ -429,9 +494,11 @@ int main(int argc, char** argv) {
     }
     csv.header();
 
-    bench_fma_fp32(csv);
-    bench_fma_bf16(csv);
-    bench_cache_sweep(csv);
+    if (!attention_only) {
+        bench_fma_fp32(csv);
+        bench_fma_bf16(csv);
+        bench_cache_sweep(csv);
+    }
     bench_attention(csv);
     const qwenvl_bench::EnvSnapshot mid = qwenvl_bench::capture_env();
     if (!qwenvl_bench::freq_stable(before, mid, 0.10)) {

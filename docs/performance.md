@@ -34,6 +34,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ./tools/trace_replay/run_experiments.sh    # writes results/week9-*.csv
 ./tools/trace_replay/run_week14.sh         # writes results/week14-*.csv
 ./bench/run_week10.sh                      # writes results/week10-*.csv and the roofline SVG
+./build/qwenvl_roofline --attention --csv results/week11-kernels.csv
 ```
 
 ---
@@ -402,6 +403,84 @@ Ruled out, with the number that ruled them out:
   single-threaded by contract.
 - **Prefill GEMM is analytic only.** The plotted prefill point is S decode
   calls. A blocked GEMM kernel would sit somewhere else.
+
+---
+
+## Week 11: A Fast CPU Decode Kernel, Scoped By The Roofline
+
+### What was measured
+
+Each week-11 lever against the scalar `paged_attention_decode` oracle, on the
+same 2B block shape and the same 1-core pin as week 10. The roofs do not
+move: DRAM 35 GB/s, 1-core bf16-equivalent 150 GFLOP/s, machine balance 4.3
+FLOP/byte. Decode AI is 1.0 unfused and 2.0 with GQA fusion.
+
+Reproduce with
+`./build/qwenvl_roofline --attention --csv results/week11-kernels.csv`.
+
+### Finding 1: hoisting the page table barely moves the needle
+
+| Kernel | ctx 128 | ctx 512 | ctx 1,280 |
+| --- | --: | --: | --: |
+| Reference | 188 µs / 5.58 GB/s | 737 µs / 5.69 GB/s | 3,905 µs / 2.69 GB/s |
+| Block-at-a-time | 177 µs / 5.93 GB/s | 672 µs / 6.24 GB/s | 3,760 µs / 2.79 GB/s |
+
+About 6%. The two heap pointer vectors and the per-token `slot()` walk were
+not the 6× gap. The inner scalar math was.
+
+### Finding 2: GQA fusion plus online softmax plus AVX-512 is a 2.4–3.0×
+
+| Kernel | ctx 128 | ctx 512 | ctx 1,280 | AI |
+| --- | --: | --: | --: | --: |
+| Fused (GQA, two-pass, scalar) | 147 µs / 7.12 GFLOP/s | 642 µs / 6.53 | 2,906 µs / 3.61 | 2.0 |
+| Fast (fusion + online + AVX-512) | **62 µs / 17.0 GFLOP/s** | **258 µs / 16.3** | **1,630 µs / 6.43** | 2.0 |
+
+Fast vs reference: **3.0× / 2.9× / 2.4×**. Achieved bandwidth on the fused
+traffic count is 8.5 GB/s at ctx 128 and 3.2 GB/s at ctx 1,280 — still **4–11×
+under the 35 GB/s DRAM roof**. Online softmax plus the AVX-512 dim loop did
+most of the work; fusion alone was ~20% at short context.
+
+The AVX path converts `uint16` to fp32 (`cvtepu16` + `fmadd`), matching the
+oracle's `static_cast<float>`. It is not `VDPBF16PS`. That instruction would
+be a 2× compute win on real bf16 bits and would not reproduce the oracle on
+this fixture.
+
+### Finding 3: the paging tax is 2.4× at a 1,280-token image
+
+Same `paged_attention_decode_fast`, same 1,280 tokens, same FLOPs:
+
+| Layout | Median | GB/s | GFLOP/s |
+| --- | --: | --: | --: |
+| 28-layer 1.75 MiB frames (2B shape) | 1,630 µs | 3.22 | 6.43 |
+| 1-layer packed frames | **670 µs** | 7.82 | 15.6 |
+
+**2.43×** slower when the useful 64 KiB of one layer sit inside a 1.75 MiB
+block. That is PagedAttention's isolated cost on this kernel: 960 µs per
+decode step at image length, or 58% of the strided time. After hoisting
+translation it is still there, because the tax is the stride, not the page
+walk. A store-layout that kept one layer's K/V contiguous would remove it
+without changing the allocator.
+
+Packed fast is 7.8 GB/s, still 22% of DRAM. Multithreading stays off.
+
+### Verification status
+
+| Check | Status |
+| --- | --- |
+| Reference tests still pass | pass, 14/14 |
+| Blocked / fused / fast agree with the oracle on scattered blocks | pass |
+| Fused / fast honor GQA head mapping | pass |
+| End-to-end prefill/decode and preempt/resume with the fast kernel | pass |
+| Each lever timed on the week-10 roofline | pass |
+| Single-thread near 35 GB/s, so start a thread pool | **no** — 8 GB/s packed |
+
+### Known limitations of these numbers
+
+- **`uint16` is not bf16.** The 2B-shape bench uses integer-to-float, so the
+  AVX path cannot use `VDPBF16PS` and still match the oracle.
+- **One layer of a 28-layer block.** A full decode step is 28 of these calls.
+  The paging tax applies on every layer.
+- **No prefill GEMM.** Prefill is still S decode calls.
 
 ---
 
@@ -1969,7 +2048,8 @@ leftover step of this one.
 
 - Week 14 serving policy — done; numbers in this file
 - Week 10 roofline — done; numbers in this file
-- CPU kernel work (weeks 11–12)
+- Week 11 fast CPU decode — done; numbers in this file
+- CPU kernel multithreading (week 12) — not started; still 8 GB/s of 35
 - Docs, the vLLM comparison, upstream
 - Host swap / CPU reference kernel (already host-only by contract)
 

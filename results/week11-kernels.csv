@@ -1,0 +1,19 @@
+kind,name,bytes,flops,median_ns,p95_ns,mad_ns,gbs,gflops,ai,notes
+attention_decode,decode ctx 128,1.04858e+06,1.04858e+06,188080,195164,501,5.57516,5.57516,1,"reference, unfused"
+attention_decode,blocked ctx 128,1.04858e+06,1.04858e+06,176759,182174,1162,5.93224,5.93224,1,block-at-a-time
+attention_decode,fused ctx 128,524288,1.04858e+06,147335,162453,452,3.55848,7.11695,2,"GQA fusion, two-pass"
+attention_decode,fast ctx 128,524288,1.04858e+06,61815,70080.5,832,8.48157,16.9631,2,fusion + online softmax + AVX-512
+attention_decode,decode ctx 512,4.1943e+06,4.1943e+06,736793,782588,4038,5.69265,5.69265,1,"reference, unfused"
+attention_decode,blocked ctx 512,4.1943e+06,4.1943e+06,672443,717211,10309,6.23741,6.23741,1,block-at-a-time
+attention_decode,fused ctx 512,2.09715e+06,4.1943e+06,642266,676340,4147,3.26524,6.53048,2,"GQA fusion, two-pass"
+attention_decode,fast ctx 512,2.09715e+06,4.1943e+06,257570,267468,2745,8.14207,16.2841,2,fusion + online softmax + AVX-512
+attention_decode,decode ctx 1280,1.04858e+07,1.04858e+07,3.90508e+06,4.26651e+06,49313,2.68516,2.68516,1,"reference, unfused"
+attention_decode,blocked ctx 1280,1.04858e+07,1.04858e+07,3.75972e+06,3.93217e+06,34534,2.78898,2.78898,1,block-at-a-time
+attention_decode,fused ctx 1280,5.24288e+06,1.04858e+07,2.90563e+06,3.09219e+06,26589,1.80438,3.60877,2,"GQA fusion, two-pass"
+attention_decode,fast ctx 1280,5.24288e+06,1.04858e+07,1.6298e+06,1.70159e+06,28152,3.21689,6.43378,2,fusion + online softmax + AVX-512
+attention_prefill,prefill S=256 as decode,2.69484e+08,2.69484e+08,4.61066e+07,4.62802e+07,86841,5.8448,5.8448,1,S independent decode calls; GEMM AI is higher
+attention_decode,fast ctx 1280 packed,5.24288e+06,1.04858e+07,670360,700054,10110,7.82099,15.642,2,1-layer frames; paging tax vs fast ctx 1280
+stream,STREAM triad 1 thread,2.01327e+08,3.35544e+07,5.76496e+06,6.22327e+06,144810,34.9224,5.82041,0.166667,AVX-512 a=b+s*c
+stream,STREAM triad OpenMP,2.01327e+08,3.35544e+07,6.44159e+06,7.46659e+06,72165,31.2542,5.20903,0.166667,all cores
+stream,memcpy 64 MiB,1.34218e+08,0,3.6092e+06,3.65135e+06,23673,37.1877,0,0,read+write bytes
+env,freq_khz,4959789,0,4940494,4959789,0,0,0,0,powersave AMD Ryzen 7 8845H w/ Radeon 780M Graphics

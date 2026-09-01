@@ -10,9 +10,10 @@ the reasoning behind what exists. This document is the plan for what comes next:
 weeks 9–16, with the early phases specified in detail and the later ones sketched
 to the level where their first task is unambiguous.
 
-**Status after week 10.** Weeks 9–10, 13–14, and 15–23 are done. The GPU box
-is closed. **Next is weeks 11–12** (fast CPU kernel, scoped by the week-10
-roofline). Those do not need a GPU. Do not treat weeks 15–16 as upcoming.
+**Status after week 11.** Weeks 9–11, 13–14, and 15–23 are done. The GPU box
+is closed. **Week 12** (multithreading) is not started: the fast kernel is at
+8 GB/s packed against a 35 GB/s DRAM roof, so a thread pool is still the
+thing week 10 ruled out. Do not treat weeks 15–16 as upcoming.
 
 **Contents**
 
@@ -422,6 +423,15 @@ inner loop.
 This is the number that answers "what does PagedAttention actually cost?" — a
 question the vLLM paper asserts is small and almost nobody measures in isolation.
 It is the most defensible original micro-result available to this project.
+
+### Week 11 outcome
+
+The fast kernel is 2.4–3.0× the reference (62 µs vs 188 µs at ctx 128).
+Block-at-a-time was 6%. GQA fusion plus online softmax plus AVX-512 did the
+rest. The paging tax at a 1,280-token image is **2.43×** (1,630 µs on 1.75 MiB
+frames vs 670 µs packed). Packed fast is still 8 GB/s of a 35 GB/s roof, so
+week 12's thread pool stays closed. Numbers in
+[`performance.md`](performance.md).
 
 ---
 
