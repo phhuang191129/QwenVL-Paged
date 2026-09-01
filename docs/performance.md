@@ -33,6 +33,7 @@ Reproduce with:
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ./tools/trace_replay/run_experiments.sh    # writes results/week9-*.csv
 ./tools/trace_replay/run_week14.sh         # writes results/week14-*.csv
+./bench/run_week10.sh                      # writes results/week10-*.csv and the roofline SVG
 ```
 
 ---
@@ -232,6 +233,175 @@ Full suite: 141 tests pass at the time of writing; 150 as of week 17.
   to roughly 300 visual tokens and never exercise the high-resolution regime.
   That is why the device resolution mix exists, and why its weights are labelled
   an assumption.
+
+---
+
+## Week 10: Measurement Rigor And The Roofline
+
+### What was measured
+
+The machine roofs this laptop actually has, the week-8 allocator table rerun
+with median / p95 / MAD on both block shapes, and where the scalar reference
+kernel sits. No kernel rewrite. The point of the phase is the decision for
+week 11.
+
+Reproduce with `./bench/run_week10.sh`. CSVs and figure:
+`results/week10-env.txt`, `week10-allocator.csv`, `week10-roofs.csv`,
+`week10-roofline.svg`.
+
+Pinned to CPU 0 for the 1-core roofs. Governor stayed `powersave` — writing
+`performance` needs root, which this session does not have. Frequency during
+the pinned roofs was 4.77 → 4.81 GHz (max 5.14). A run that *drops* more than
+10% from the start frequency is rejected; a turbo ramp-up is not. `acpitz`
+reads 105 °C and is treated as a stuck ACPI zone, not a package temperature
+(the only other zone is `iwlwifi` at 40 °C). DIMM type and speed were not
+readable without root `dmidecode`.
+
+### Finding 1: the 68 GB/s CoW number was L3, not DRAM
+
+Week 8 reported copy-on-write at 7.8 µs for a 512 KiB block and called that
+~68 GB/s of DRAM. A working-set sweep of the same triad, vectorized, on one
+core:
+
+| Working set (3 arrays) | Median GB/s | Likely level |
+| --- | --: | --- |
+| 12 KiB | 138 | L1d (32 KiB/core) |
+| 96 KiB | 83.5 | L2 |
+| 768 KiB – 12 MiB | 70–80 | L3 (16 MiB shared) |
+| 48–384 MiB | **34–35** | DRAM |
+
+STREAM triad is 34.7 GB/s single-thread, 30.7 GB/s with OpenMP on 8 cores.
+`memcpy` of 64 MiB is 37.1 GB/s. Three independent large copies agree: **DRAM
+on this box is about 35 GB/s**, not 90. The week-8 68 GB/s sits on the L3
+plateau, which is exactly where a 512 KiB block lives. Dual-channel DDR5-5600
+is still the paper estimate (89.6 GB/s); this measurement does not confirm the
+DIMM, and eight threads did not raise the roof. The STREAM-within-15%-of-peak
+check fails. The benchmark is not the thing that is wrong — the 90 GB/s
+estimate was, for the access this machine actually gives a CPU process.
+
+### Finding 2: one-core compute is 61 GFLOP/s fp32 and 150 GFLOP/s bf16
+
+AVX-512 FMA, 16 independent `zmm` accumulators, 4.77 GHz:
+
+| Microbench | GFLOP/s | Paper 1-core | Fraction |
+| --- | --: | --: | --: |
+| `_mm512_fmadd_ps` | **61.0** | ~154 | 40% |
+| `_mm512_dpbf16_ps` (64 FLOP/insn) | **149.8** | ~308 | 49% |
+
+Zen 4 implements 512-bit FMA by double-pumping two 256-bit units. The paper
+1-core number is 2 × 8 fp32 × 2 FLOP × 4.8 GHz. The loop does not reach it.
+The measured 61 / 150 numbers are the compute roofs week 11 is allowed to use.
+Eight-core paper peaks (~1 / 2 TFLOP/s) do not apply to a single-threaded
+kernel.
+
+Machine balance, using measured DRAM and measured 1-core FMA:
+
+| | FLOP/byte |
+| --- | --: |
+| fp32 | 61 / 35 = **1.7** |
+| bf16 | 150 / 35 = **4.3** |
+
+The roadmap's ~11 / ~23 used the paper peaks and the 90 GB/s DRAM guess.
+
+### Finding 3: decode attention is memory-bound and the reference is 6× under the roof
+
+Unfused decode, one query head per K/V load, `bytes_per_element = 2`:
+
+```
+bytes = 2 × head_dim × 2
+flops = 4 × head_dim
+AI    = 1.0 FLOP/byte
+```
+
+GQA group size G = 16/8 = 2. Fusing the group doubles AI to 2.0. The
+reference does not fuse.
+
+Predicted GFLOP/s if the kernel hit DRAM: 35 GB/s × 1.0 = **35 GFLOP/s**.
+Measured `paged_attention_decode` on the 2B block shape, 16 query heads, one
+layer, `uint16` elements:
+
+| Context | Median ns | GFLOP/s | GB/s | Fraction of 35 GB/s |
+| --: | --: | --: | --: | --: |
+| 128 | 170,236 | 6.16 | 6.16 | 18% |
+| 512 | 785,157 | 5.34 | 5.34 | 15% |
+| 1,280 | 3,877,339 | 2.70 | 2.70 | 8% |
+
+Prefill of S=256, implemented as S decode calls, is the same 5.4 GFLOP/s and
+the same AI = 1.0. A real GEMM prefill at S=1,280 would load Q/K/V once and
+do ~2 H_q D S² FLOP, AI on the order of **10²–10³ FLOP/byte** — compute-bound.
+The reference never sees that regime. Both roofs matter for a VLM; only the
+memory-bound one is populated on this plot.
+
+The kernel is under the roof for explained reasons: scalar inner loop, a
+heap-allocated pointer walk before any math, two passes (K then V), and a
+28-layer block whose useful 64 KiB of one layer sit inside a 1.75 MiB frame.
+That last one is the paging tax in miniature.
+
+### Finding 4: the week-8 allocator table still holds; CoW scales; the scheduler got slower
+
+Warmup 3, 11 samples, median / p95 / MAD. Same 128-block pool.
+
+| Operation | Week 8 (512 KiB) | Week 10 (512 KiB) | Week 10 (1.75 MiB) |
+| --- | --: | --: | --: |
+| `allocate` + `release` | 6.4 ns | **6.9 ns** | 7.0 ns |
+| `fork_sequence` (8 blocks) | 57.5 ns | **61 ns** | 61 ns |
+| First write to a shared block (CoW) | 7,780 ns | **7,363 ns** | **33,282 ns** |
+| Scheduler admit + retire | 161.8 ns | **326 ns** | 327 ns |
+
+512 KiB CoW is 71 GB/s (L3). 1.75 MiB CoW is 33.3 µs / 55 GB/s — above the
+roadmap's 27 µs-at-68-GB/s estimate because 1.75 MiB is past L2 (1 MiB/core)
+and only partly L3-resident. Linear in block bytes, not in a DRAM roof that
+the block does not reach.
+
+Allocate and fork reproduce week 8 within noise. The scheduler is **2×** the
+week-8 figure: week 14's lifetime reservation and chunked prefill do more
+work per admit. It is still noise next to a 170 µs–4 ms attention call.
+
+### The decision this phase exists to produce
+
+Decode AI is 1.0, machine balance is 4.3 (bf16). The kernel is memory-bound
+on paper and 6× under the memory roof in practice. Week 11 is allowed three
+levers:
+
+1. **GQA fusion** — the only algorithmic AI change available. One K/V load
+   for both query heads, AI 1.0 → 2.0, memory roof 35 → 70 GFLOP/s.
+2. **Block-at-a-time iteration + AVX-512** — chase the 35 GB/s DRAM roof.
+   Vectorization, hoisting the page-table walk, and not heap-allocating two
+   pointer vectors per call are all "approach the roof," not "raise it."
+3. **Online softmax** — this kernel already reads each K and V once. The win
+   is dropping the `scores[]` materialization, not halving KV traffic.
+
+Ruled out, with the number that ruled them out:
+
+- **Chasing the 154 GFLOP/s paper FMA peak.** At AI = 1.0 the compute roof
+  (61 GFLOP/s) is already above the DRAM roof (35). More FMA throughput does
+  not move a kernel that is 6× under 35 GB/s.
+- **Multithreading the kernel** until the single-thread path is near 35 GB/s.
+  OpenMP STREAM was *slower* than one thread (30.7 vs 34.7).
+- **Quantized KV** — still week 16. It is the other AI lever (move fewer
+  bytes). Not this phase.
+
+### Verification status
+
+| Check | Status |
+| --- | --- |
+| STREAM within ~15% of theoretical peak | **fail** — 35 vs 90 GB/s; DIMM unconfirmed; OpenMP did not help |
+| Reference kernel on the memory-bound roof | **fail, explained** — 6× under; scalar / two-pass / 1.75 MiB stride |
+| Week-8 512 KiB figures reproduce within noise | pass, except scheduler (week 14, recorded) |
+| CoW scales to ~27 µs at 1.75 MiB | **33 µs / 55 GB/s** — linear, but the 68 GB/s assumption was L3 |
+
+### Known limitations of these numbers
+
+- **Governor is powersave.** Frequency during the pinned roofs was 4.8 GHz;
+  the numbers are still clock-stable. They are not a `performance`-governor
+  run.
+- **No DIMM readout.** "35 GB/s is DRAM" is from the working-set cliff, not
+  from `dmidecode`.
+- **OpenMP STREAM used 8 threads and lost.** A better NUMA/pinning recipe
+  might raise the multi-core roof; it would not change week 11, which is
+  single-threaded by contract.
+- **Prefill GEMM is analytic only.** The plotted prefill point is S decode
+  calls. A blocked GEMM kernel would sit somewhere else.
 
 ---
 
@@ -1798,7 +1968,8 @@ leftover step of this one.
 **Does not need a GPU**
 
 - Week 14 serving policy — done; numbers in this file
-- CPU kernel work (weeks 10–12)
+- Week 10 roofline — done; numbers in this file
+- CPU kernel work (weeks 11–12)
 - Docs, the vLLM comparison, upstream
 - Host swap / CPU reference kernel (already host-only by contract)
 

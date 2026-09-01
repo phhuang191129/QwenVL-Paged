@@ -159,8 +159,9 @@ Or run an individual module binary directly:
 ## Benchmarks
 
 `bench/` holds a dependency-free `std::chrono` harness reporting allocator
-latency, fork cost, copy-on-write cost, and scheduler throughput. It reports
-timings rather than asserting on them, so it is not registered with CTest.
+latency, fork cost, copy-on-write cost, and scheduler throughput, plus the
+week-10 roofs (`qwenvl_roofline`). Allocator numbers are median / p95 / MAD
+of 11 samples after 3 warmups. They are not registered with CTest.
 
 Build with optimizations on, or the numbers are not comparable — CMake does not
 set a build type by default:

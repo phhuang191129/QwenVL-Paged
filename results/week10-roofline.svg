@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="460" font-family="DejaVu Sans, sans-serif" font-size="12">
+<rect width="720" height="460" fill="white"/>
+<text x="360" y="22" text-anchor="middle" font-size="14">Week 10 roofline — Ryzen 7 8845H, reference paged attention</text>
+<rect x="70.0" y="30.0" width="520.0" height="360.0" fill="none" stroke="#333"/>
+<line x1="70.0" y1="30.0" x2="70.0" y2="390.0" stroke="#ddd"/>
+<text x="70.0" y="406.0" text-anchor="middle">0.1</text>
+<line x1="243.3" y1="30.0" x2="243.3" y2="390.0" stroke="#ddd"/>
+<text x="243.3" y="406.0" text-anchor="middle">1</text>
+<line x1="416.7" y1="30.0" x2="416.7" y2="390.0" stroke="#ddd"/>
+<text x="416.7" y="406.0" text-anchor="middle">10</text>
+<line x1="590.0" y1="30.0" x2="590.0" y2="390.0" stroke="#ddd"/>
+<text x="590.0" y="406.0" text-anchor="middle">100</text>
+<line x1="70.0" y1="390.0" x2="590.0" y2="390.0" stroke="#ddd"/>
+<text x="62.0" y="394.0" text-anchor="end">0.1</text>
+<line x1="70.0" y1="311.8" x2="590.0" y2="311.8" stroke="#ddd"/>
+<text x="62.0" y="315.8" text-anchor="end">1</text>
+<line x1="70.0" y1="233.5" x2="590.0" y2="233.5" stroke="#ddd"/>
+<text x="62.0" y="237.5" text-anchor="end">10</text>
+<line x1="70.0" y1="155.3" x2="590.0" y2="155.3" stroke="#ddd"/>
+<text x="62.0" y="159.3" text-anchor="end">100</text>
+<line x1="70.0" y1="77.1" x2="590.0" y2="77.1" stroke="#ddd"/>
+<text x="62.0" y="81.1" text-anchor="end">1000</text>
+<text x="330.0" y="426.0" text-anchor="middle">Arithmetic intensity (FLOP/byte)</text>
+<text transform="translate(18 210.0) rotate(-90)" text-anchor="middle">GFLOP/s</text>
+<path d="M 70.00 273.69 L 83.00 267.82 L 96.00 261.95 L 109.00 256.09 L 122.00 250.22 L 135.00 244.35 L 148.00 238.48 L 161.00 232.62 L 174.00 226.75 L 187.00 220.88 L 200.00 215.02 L 213.00 209.15 L 226.00 203.28 L 239.00 197.42 L 252.00 191.55 L 265.00 185.68 L 278.00 179.82 L 291.00 173.95 L 304.00 168.08 L 317.00 162.21 L 330.00 156.35 L 343.00 150.48 L 356.00 144.61 L 369.00 138.75 L 382.00 132.88 L 395.00 127.01 L 408.00 121.15 L 421.00 115.28 L 434.00 109.41 L 447.00 103.55 L 460.00 97.68 L 473.00 91.81 L 486.00 85.94 L 499.00 80.08 L 512.00 74.21 L 525.00 68.34 L 538.00 62.48 L 551.00 56.61 L 564.00 50.74 L 577.00 44.88 L 590.00 39.01" fill="none" stroke="#1f77b4" stroke-width="2"/>
+<text x="152.7010174847415" y="230.36318319470377" fill="#1f77b4">DRAM 30.7 GB/s</text>
+<line x1="70.0" y1="172.1" x2="590.0" y2="172.1" stroke="#d62728" stroke-dasharray="6 3"/>
+<text x="586.0" y="166.0965312828896" text-anchor="end" fill="#d62728">fp32 61 GFLOP/s</text>
+<line x1="70.0" y1="141.6" x2="590.0" y2="141.6" stroke="#ff7f0e" stroke-dasharray="2 3"/>
+<text x="586.0" y="135.58385650633429" text-anchor="end" fill="#ff7f0e">bf16 150 GFLOP/s</text>
+<circle cx="243.3" cy="250.0" r="5" fill="#2ca02c"/>
+<text x="251.3" y="254.0" fill="#2ca02c">decode ctx 128</text>
+<circle cx="243.3" cy="254.8" r="5" fill="#2ca02c"/>
+<text x="251.3" y="258.8" fill="#2ca02c">decode ctx 512</text>
+<circle cx="243.3" cy="278.0" r="5" fill="#2ca02c"/>
+<text x="251.3" y="282.0" fill="#2ca02c">decode ctx 1280</text>
+<circle cx="243.3" cy="254.7" r="5" fill="#9467bd"/>
+<text x="251.3" y="258.7" fill="#9467bd">prefill S=256 as decode</text>
+</svg>

@@ -1,0 +1,19 @@
+kind,name,bytes,flops,median_ns,p95_ns,mad_ns,gbs,gflops,ai,notes
+fma,AVX-512 FMA fp32,0,2.14748e+09,3.51853e+07,3.52118e+07,20638,0,61.0336,0,"16 independent zmm accs, 1 core"
+fma,AVX-512 VDPBF16PS,0,4.29497e+09,2.86637e+07,2.91841e+07,164365,0,149.84,0,"64 FLOP/insn, 1 core"
+cache_sweep,triad 4 KiB,12288,2048,88.7656,89.6953,0.328125,138.432,23.072,0.166667,
+cache_sweep,triad 32 KiB,98304,16384,1177.34,1209.73,3.76562,83.4964,13.9161,0.166667,
+cache_sweep,triad 256 KiB,786432,131072,9874.58,10566,174.844,79.6421,13.2737,0.166667,
+cache_sweep,triad 1024 KiB,3.14573e+06,524288,43706.2,50475.6,1108.38,71.9743,11.9957,0.166667,
+cache_sweep,triad 4096 KiB,1.25829e+07,2.09715e+06,178513,256817,6369.25,70.4875,11.7479,0.166667,
+cache_sweep,triad 16384 KiB,5.03316e+07,8.38861e+06,1.31247e+06,1.43499e+06,26449,38.3489,6.39149,0.166667,
+cache_sweep,triad 32768 KiB,1.00663e+08,1.67772e+07,2.8629e+06,2.98827e+06,28092,35.1612,5.86021,0.166667,
+cache_sweep,triad 131072 KiB,4.02653e+08,6.71089e+07,1.19492e+07,1.29288e+07,122256,33.697,5.61616,0.166667,
+attention_decode,decode ctx 128,1.04858e+06,1.04858e+06,170236,183866,702,6.15954,6.15954,1,"unfused GQA, one layer, 2B shape"
+attention_decode,decode ctx 512,4.1943e+06,4.1943e+06,785157,810520,7244,5.34199,5.34199,1,"unfused GQA, one layer, 2B shape"
+attention_decode,decode ctx 1280,1.04858e+07,1.04858e+07,3.87734e+06,4.11475e+06,86441,2.70437,2.70437,1,"unfused GQA, one layer, 2B shape"
+attention_prefill,prefill S=256 as decode,2.69484e+08,2.69484e+08,5.02641e+07,5.05265e+07,160979,5.36136,5.36136,1,S independent decode calls; GEMM AI is higher
+stream,STREAM triad 1 thread,2.01327e+08,3.35544e+07,5.80879e+06,5.9378e+06,47929,34.6589,5.77649,0.166667,AVX-512 a=b+s*c
+stream,STREAM triad OpenMP,2.01327e+08,3.35544e+07,6.56154e+06,7.62546e+06,122728,30.6828,5.1138,0.166667,all cores
+stream,memcpy 64 MiB,1.34218e+08,0,3.61742e+06,3.75071e+06,54241,37.1032,0,0,read+write bytes
+env,freq_khz,4813721,0,4765845,4813721,0,0,0,0,powersave AMD Ryzen 7 8845H w/ Radeon 780M Graphics

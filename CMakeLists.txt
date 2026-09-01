@@ -70,7 +70,21 @@ endforeach()
 # Latency harness for allocator, fork, copy-on-write, and scheduler costs. Not
 # registered with CTest: it reports timings rather than asserting on them.
 add_executable(qwenvl_paged_bench bench/benchmark_main.cpp)
+target_include_directories(qwenvl_paged_bench PRIVATE bench)
 target_link_libraries(qwenvl_paged_bench PRIVATE qwenvl_paged_core)
+
+# Week 10 roofs: STREAM, cache sweep, AVX-512 FMA, reference-kernel position.
+add_executable(qwenvl_roofline bench/roofline_main.cpp)
+target_include_directories(qwenvl_roofline PRIVATE bench)
+target_link_libraries(qwenvl_roofline PRIVATE qwenvl_paged_core)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(qwenvl_roofline PRIVATE -O2 -march=native)
+endif()
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(qwenvl_roofline PRIVATE OpenMP::OpenMP_CXX)
+    target_compile_definitions(qwenvl_roofline PRIVATE QWENVL_HAVE_OPENMP=1)
+endif()
 
 # Qwen3-VL workload replay: drives the scheduler and cache manager from a trace
 # and compares against a contiguous worst-case-reservation baseline.

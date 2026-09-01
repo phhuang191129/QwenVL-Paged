@@ -10,9 +10,9 @@ the reasoning behind what exists. This document is the plan for what comes next:
 weeks 9–16, with the early phases specified in detail and the later ones sketched
 to the level where their first task is unambiguous.
 
-**Status after week 14.** Weeks 9, 13–14, and 15–23 are done. The GPU box is
-closed. **Next is weeks 10–12** (roofline, then the CPU kernel). Those do not
-need a GPU. Do not treat weeks 15–16 as upcoming.
+**Status after week 10.** Weeks 9–10, 13–14, and 15–23 are done. The GPU box
+is closed. **Next is weeks 11–12** (fast CPU kernel, scoped by the week-10
+roofline). Those do not need a GPU. Do not treat weeks 15–16 as upcoming.
 
 **Contents**
 
@@ -351,6 +351,26 @@ Everything else (vectorization width, softmax passes, prefetching) chases the
 memory roof rather than raising it. Week 11 is scoped accordingly, and the
 optimizations *not* attempted are recorded with the roofline reasoning that ruled
 them out.
+
+### Week 10 outcome
+
+Measured. The numbers are in [`performance.md`](performance.md). Three things
+went differently than planned.
+
+**DRAM is 35 GB/s, not 90.** STREAM, 64 MiB `memcpy`, and the large end of
+the working-set sweep agree. The week-8 68 GB/s CoW was the L3 plateau. DIMM
+speed is unconfirmed (no root `dmidecode`). OpenMP on 8 cores did not raise
+the roof. The STREAM-within-15%-of-peak check fails because the estimate was
+wrong, not the triad.
+
+**The reference is 6× under the memory roof, not on it.** Decode AI is 1.0
+FLOP/byte (bf16, unfused). Predicted 35 GFLOP/s; measured 6.2 at ctx 128 and
+2.7 at ctx 1,280. The gap is the scalar two-pass kernel and the 1.75 MiB
+block stride — explained, which is what the check asked for.
+
+**1-core compute is 61 GFLOP/s fp32 / 150 GFLOP/s bf16**, 40–50% of the Zen 4
+paper peak. Balance is 1.7 / 4.3 FLOP/byte, not 11 / 23. Week 11 chases
+35 GB/s and fuses GQA; it does not chase FMA peak or start a thread pool.
 
 ---
 

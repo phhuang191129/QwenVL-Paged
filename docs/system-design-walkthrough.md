@@ -1241,11 +1241,9 @@ ordering: a frame may not be recycled while a kernel still reads it, so
 `release`, `swap_out`, and `preempt` must wait on the step's completion event.
 
 **"What would you do next?"**
-Weeks 10–12: a measured CPU roofline, then make the reference kernel fast
-enough to sit on it. Prefix caching and the GPU decode path are already
-shipped; the remaining CPU gap is that the kernel is still a correctness
-reference. For production serving the next scheduler lever is publishing
-only complete prefix blocks (the pin+CoW tail currently *raises* peak
-cache) and a cost model that can see chunking's wall-clock TTFT, which
-the token-cost replay cannot.
+Weeks 11–12: make the reference kernel chase the 35 GB/s DRAM roof week 10
+measured, and fuse the GQA group (the only AI lever that is not
+quantization). Prefix caching, the GPU decode path, and the roofline are
+already shipped. Do not chase the paper FMA peak; at AI = 1.0 the compute
+roof is already above DRAM.
 

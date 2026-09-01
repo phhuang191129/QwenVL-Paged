@@ -1,0 +1,11 @@
+benchmark,block_kib,ops_per_sample,n,median_ns_per_op,p95_ns_per_op,mad_ns_per_op,ops_per_sec
+allocate + release,512,50000,11,6.93588,7.52598,0.16972,1.44178e+08
+"fork sequence (8 blocks, with setup)",512,2000,11,315.981,328.563,2.635,3.16474e+06
+fork sequence (8 blocks),512,1,11,61,90,1,1.63934e+07
+copy-on-write (1 block),512,1,11,7363,7434,40,135814
+scheduler admit + retire request,512,16000,11,325.804,345.318,1.4245,3.06933e+06
+allocate + release,1792,50000,11,6.96714,7.18775,0.1112,1.43531e+08
+"fork sequence (8 blocks, with setup)",1792,2000,11,316.628,319.07,1.3175,3.15828e+06
+fork sequence (8 blocks),1792,1,11,61,85.5,1,1.63934e+07
+copy-on-write (1 block),1792,1,11,33282,33322,20,30046.3
+scheduler admit + retire request,1792,16000,11,327.33,349.01,4.169,3.05502e+06
