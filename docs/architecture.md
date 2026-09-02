@@ -97,6 +97,13 @@ CUDA or Triton kernel would want to issue as a single vectorized load. The K and
 V halves of a layer are separated by `stream_stride()` so a kernel can address
 them as two independent tensors sharing one allocation.
 
+Default frames store every layer (`layers_per_frame == 0`). Setting
+`layers_per_frame = 1` stores one layer per frame; `CacheView` then holds one
+block table per layer and `reserve_tokens` fills those tables layer-major so
+one layer's frames are adjacent in the pool. The allocator still sees a
+smaller `byte_size()`, not a different allocation protocol. Replay stays on
+the default: the same token capacity needs `num_layers` times as many frames.
+
 `KVBlockLayout::element_offset` is bounds-checked and returns offsets in
 *elements*; multiply by `BlockShape::bytes_per_element` for a byte offset. All
 translation from a sequence-global token position to a physical slot goes

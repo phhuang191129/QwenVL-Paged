@@ -54,6 +54,16 @@ TEST(BlockShapeTest, ByteSizeScalesLinearlyWithLayerCount) {
     EXPECT_EQ(doubled.byte_size(), base * 2);
 }
 
+TEST(BlockShapeTest, OneLayerPerFrameShrinksByteSizeByLayerCount) {
+    const BlockShape all_layers = make_shape();
+    BlockShape packed = make_shape();
+    packed.layers_per_frame = 1;
+
+    EXPECT_EQ(packed.byte_size(), all_layers.byte_size() / all_layers.num_layers);
+    EXPECT_TRUE(packed.per_layer_frames());
+    EXPECT_EQ(packed.frame_layers(), 1u);
+}
+
 TEST(LogicalBlockTest, DefaultBlockIsEmpty) {
     LogicalBlock block;
     EXPECT_TRUE(block.empty());

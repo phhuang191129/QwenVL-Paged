@@ -35,6 +35,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ./tools/trace_replay/run_week14.sh         # writes results/week14-*.csv
 ./bench/run_week10.sh                      # writes results/week10-*.csv and the roofline SVG
 ./build/qwenvl_roofline --attention --csv results/week11-kernels.csv
+# packed + layer-major rows live in that same CSV
 ```
 
 ---
@@ -463,11 +464,14 @@ without changing the allocator.
 
 Packed fast is 7.8 GB/s, still 22% of DRAM. Multithreading stays off.
 
+The layout was implemented. Re-measurement did not reproduce a clean 2.43×
+stride tax; see the layer-major section below.
+
 ### Verification status
 
 | Check | Status |
 | --- | --- |
-| Reference tests still pass | pass, 14/14 |
+| Reference tests still pass | pass, 15/15 |
 | Blocked / fused / fast agree with the oracle on scattered blocks | pass |
 | Fused / fast honor GQA head mapping | pass |
 | End-to-end prefill/decode and preempt/resume with the fast kernel | pass |
@@ -481,6 +485,85 @@ Packed fast is 7.8 GB/s, still 22% of DRAM. Multithreading stays off.
 - **One layer of a 28-layer block.** A full decode step is 28 of these calls.
   The paging tax applies on every layer.
 - **No prefill GEMM.** Prefill is still S decode calls.
+
+---
+
+## Layer-major store layout
+
+### What changed
+
+`BlockShape::layers_per_frame` (default 0 = all layers in one frame) packs one
+layer per physical frame when set to 1. `MemoryAllocator` is untouched: frame
+size comes from `byte_size()`, which uses `frame_layers()`. `KVCacheManager`
+holds one `BlockTable` per layer and `reserve_tokens` fills those tables
+layer-major (all of L0, then all of L1, …) so a decode of one layer walks
+adjacent 64 KiB frames instead of a 1.75 MiB stride. `ensure_token_writable`
+takes a layer. Prefix, fork, and swap walk every table. Scheduler admission
+multiplies token-blocks by `num_layers` when packing is on.
+
+Default packing is unchanged. Week 9 / 14 replay stays on 1.75 MiB frames so
+the published pool counts stay valid. Opt in on the 2B kernel bench with
+`layers_per_frame = 1` and `max_blocks >= token_blocks * 28`.
+
+Reproduce with `./build/qwenvl_roofline --attention --csv results/week11-kernels.csv`.
+
+### Finding: layer-major can match packed, and it does not remove the 2.43× mode
+
+Same `paged_attention_decode_fast`, ctx 1,280, 2B geometry, 1-core pin. The
+committed CSV from this pass:
+
+| Layout | Median | GB/s |
+| --- | --: | --: |
+| 28-layer 1.75 MiB frames | 954 µs | 5.50 |
+| 1-layer packed frames | **586 µs** | 8.95 |
+| Layer-major, all 28 layers filled | **590 µs** | 8.88 |
+| Layer-major, only layer 0 filled | 596 µs | 8.80 |
+
+Layer-major equals packed in this file (590 / 586 = 1.01×). Filling only
+layer 0 in the same 140 MiB pool does not move it, so the win is not "the
+other 27 layers evicted L3 during fill."
+
+That is not the whole story. Repeating the binary back-to-back on this box
+produces two regimes, not one number:
+
+| Layout | Fast regime | Slow regime |
+| --- | --: | --: |
+| Packed 1-layer (5 MiB pool) | 580–620 µs | not seen |
+| Layer-major (140 MiB pool) | 587–602 µs | **1,400–1,470 µs** |
+| 28-layer 1.75 MiB frames | 606–700 µs | 850–954 µs |
+
+The slow layer-major mode is **2.4×** packed — the week-11 paging-tax
+figure, on a layout whose L0 frames are consecutive. Week 11's 1,630 µs on
+1.75 MiB frames did not come back; those frames now sit between the two
+modes. The 2.43× number is a residency mode (the 5 MiB of one layer in L3
+versus not), not an immutable stride through a 1.75 MiB block.
+
+Packed almost always stays hot: its pool *is* the 5 MiB working set. Layer-major
+keeps the other 27 layers in the same slab, and half the runs fall into the
+slow mode. Default all-layers-in-one-frame is more stable than layer-major
+and no longer 2.43×.
+
+Do not turn layer-major on for serving on the strength of the fast-regime
+row. The feature is correct (15/15 PagedAttention, per-layer CoW and prefix
+tests) and cheaper on a single-layer write (64 KiB CoW instead of 1.75 MiB).
+It is not a reliable way to delete the paging tax on this CPU.
+
+Packed / fast-regime layer-major is still ~9 GB/s of a 28–32 GB/s STREAM
+triad. Week 12 stays closed.
+
+### Verification status
+
+| Check | Status |
+| --- | --- |
+| Default packing: existing Block / CacheView / KV / Scheduler / EndToEnd | pass |
+| `layers_per_frame=1` shrinks `byte_size` by `num_layers` | pass |
+| Layer-major reserve is one frame per layer, consecutive in one layer | pass |
+| `CacheView::slot` reads each layer from its own frame | pass |
+| CoW remaps only the written layer | pass |
+| Prefix attach maps every layer table | pass |
+| Fast / fused / blocked agree with the oracle on both layers | pass |
+| Admission counts `token_blocks * num_layers` | pass |
+| Layer-major matches packed and removes the 2.43× tax | **no** — matches when hot; 2.4× when not |
 
 ---
 
@@ -2049,8 +2132,10 @@ leftover step of this one.
 - Week 14 serving policy — done; numbers in this file
 - Week 10 roofline — done; numbers in this file
 - Week 11 fast CPU decode — done; numbers in this file
-- CPU kernel multithreading (week 12) — not started; still 8 GB/s of 35
-- Docs, the vLLM comparison, upstream
+- Layer-major store layout — done; matches packed when hot, does not delete the 2.4× slow mode
+- CPU kernel multithreading (week 12) — not started; still 9 GB/s of 32
+- Docs, the vLLM comparison — comparison in [`vllm-comparison.md`](vllm-comparison.md)
+- Upstream
 - Host swap / CPU reference kernel (already host-only by contract)
 
 **Would be a new GPU session, not a leftover**

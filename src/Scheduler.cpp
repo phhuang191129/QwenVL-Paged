@@ -281,11 +281,14 @@ std::uint32_t Scheduler::blocks_for_tokens(std::uint32_t token_count) const noex
         return 0;
     }
 
-    const std::uint32_t tokens_per_block = block->shape().tokens_per_block;
+    const BlockShape& shape = block->shape();
+    const std::uint32_t tokens_per_block = shape.tokens_per_block;
     if (tokens_per_block == 0) {
         return 0;
     }
-    return (token_count + tokens_per_block - 1) / tokens_per_block;
+    const std::uint32_t token_blocks = (token_count + tokens_per_block - 1) / tokens_per_block;
+    const std::uint32_t tables = shape.per_layer_frames() ? shape.num_layers : 1;
+    return token_blocks * tables;
 }
 
 void Scheduler::reclaim_for_admission(

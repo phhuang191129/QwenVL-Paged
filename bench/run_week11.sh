@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Reproduces the Week 11 kernel comparison in docs/performance.md.
+# Reproduces the Week 11 kernel comparison and the layer-major rows in
+# docs/performance.md.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p results

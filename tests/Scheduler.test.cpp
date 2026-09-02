@@ -708,5 +708,27 @@ TEST(SchedulerSizeAwareTest, CannotStarveALargeHead) {
     EXPECT_EQ(unblocked.prefill_requests.front(), 2u);
 }
 
+TEST(SchedulerPerLayerTest, AdmissionCountsOneFramePerLayer) {
+    AllocatorConfig alloc = make_allocator_config(4);
+    alloc.block_shape.layers_per_frame = 1;
+    MemoryAllocator allocator(alloc);
+    KVCacheManager cache(allocator);
+    Scheduler scheduler(make_scheduler_config(), cache, allocator);
+
+    Request first = make_request(1, 16);
+    first.sampling.max_decode_tokens = 16;
+    scheduler.enqueue(first);
+    const BatchPlan admitted = scheduler.schedule_next();
+    ASSERT_EQ(admitted.prefill_requests.size(), 1u);
+    finish_scheduled_prefill(scheduler, admitted);
+
+    // Lifetime is 2 token-blocks × 2 layers = 4 frames. A second 16-token
+    // request would steal the decode reservation if admission still counted
+    // token-blocks only.
+    scheduler.enqueue(make_request(2, 16));
+    EXPECT_TRUE(scheduler.schedule_next().prefill_requests.empty());
+    EXPECT_EQ(scheduler.state(2), RequestState::Pending);
+}
+
 } // namespace
 } // namespace qwenvl_paged

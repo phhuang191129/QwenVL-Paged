@@ -162,9 +162,12 @@ template <typename T>
     const std::uint32_t logical_blocks =
         (params.context_len + tokens_per_block - 1) / tokens_per_block;
 
+    const bool per_layer = shape.per_layer_frames();
+    const std::uint32_t offset_layer = per_layer ? 0 : params.layer;
     std::vector<const std::byte*> frames(logical_blocks, nullptr);
     for (std::uint32_t logical = 0; logical < logical_blocks; ++logical) {
-        frames[logical] = view.block_bytes(logical);
+        frames[logical] =
+            per_layer ? view.block_bytes(logical, params.layer) : view.block_bytes(logical);
         if (frames[logical] == nullptr) {
             return false;
         }
@@ -184,7 +187,7 @@ template <typename T>
             const std::uint32_t end = std::min(begin + tokens_per_block, params.context_len);
             for (std::uint32_t token = begin; token < end; ++token) {
                 const std::optional<std::size_t> offset = view.layout.element_offset(
-                    params.layer, KVStream::Key, token - begin, kv_head);
+                    offset_layer, KVStream::Key, token - begin, kv_head);
                 if (!offset.has_value()) {
                     return false;
                 }
@@ -206,7 +209,7 @@ template <typename T>
             const std::uint32_t end = std::min(begin + tokens_per_block, params.context_len);
             for (std::uint32_t token = begin; token < end; ++token) {
                 const std::optional<std::size_t> offset = view.layout.element_offset(
-                    params.layer, KVStream::Value, token - begin, kv_head);
+                    offset_layer, KVStream::Value, token - begin, kv_head);
                 if (!offset.has_value()) {
                     return false;
                 }
@@ -345,9 +348,12 @@ template <typename T, bool kFuseGqa, bool kOnline, bool kAvx>
     const std::uint32_t logical_blocks =
         (params.context_len + tokens_per_block - 1) / tokens_per_block;
 
+    const bool per_layer = shape.per_layer_frames();
+    const std::uint32_t offset_layer = per_layer ? 0 : params.layer;
     std::vector<const std::byte*> frames(logical_blocks, nullptr);
     for (std::uint32_t logical = 0; logical < logical_blocks; ++logical) {
-        frames[logical] = view.block_bytes(logical);
+        frames[logical] =
+            per_layer ? view.block_bytes(logical, params.layer) : view.block_bytes(logical);
         if (frames[logical] == nullptr) {
             return false;
         }
@@ -355,12 +361,12 @@ template <typename T, bool kFuseGqa, bool kOnline, bool kAvx>
 
     auto key_ptr = [&](const T* base, std::uint32_t token_in_block, std::uint32_t kv_head) -> const T* {
         const std::optional<std::size_t> offset =
-            view.layout.element_offset(params.layer, KVStream::Key, token_in_block, kv_head);
+            view.layout.element_offset(offset_layer, KVStream::Key, token_in_block, kv_head);
         return offset.has_value() ? base + *offset : nullptr;
     };
     auto value_ptr = [&](const T* base, std::uint32_t token_in_block, std::uint32_t kv_head) -> const T* {
         const std::optional<std::size_t> offset =
-            view.layout.element_offset(params.layer, KVStream::Value, token_in_block, kv_head);
+            view.layout.element_offset(offset_layer, KVStream::Value, token_in_block, kv_head);
         return offset.has_value() ? base + *offset : nullptr;
     };
 

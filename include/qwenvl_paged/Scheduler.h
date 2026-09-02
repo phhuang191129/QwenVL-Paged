@@ -212,7 +212,10 @@ public:
 
 private:
     /**
-     * @brief Returns how many blocks a prompt of this length occupies.
+     * @brief Returns how many physical frames a prompt of this length occupies.
+     *
+     * Equals token-blocks when every layer shares one frame. Multiplies by
+     * `num_layers` when `BlockShape::layers_per_frame == 1`.
      */
     [[nodiscard]] std::uint32_t blocks_for_tokens(std::uint32_t token_count) const noexcept;
 

@@ -149,6 +149,7 @@ PYBIND11_MODULE(qwenvl_paged, module) {
         .def_readwrite("num_kv_heads", &BlockShape::num_kv_heads)
         .def_readwrite("head_dim", &BlockShape::head_dim)
         .def_readwrite("bytes_per_element", &BlockShape::bytes_per_element)
+        .def_readwrite("layers_per_frame", &BlockShape::layers_per_frame)
         .def("byte_size", &BlockShape::byte_size);
 
     py::class_<HostMemoryOptions>(module, "HostMemoryOptions")
@@ -270,7 +271,8 @@ PYBIND11_MODULE(qwenvl_paged, module) {
             &KVCacheManager::ensure_token_writable,
             py::arg("sequence_id"),
             py::arg("token_position"),
-            py::arg("cache_kind") = CacheKind::TextKV)
+            py::arg("cache_kind") = CacheKind::TextKV,
+            py::arg("layer") = 0)
         .def("swap_out_sequence", &KVCacheManager::swap_out_sequence)
         .def("swap_in_sequence", &KVCacheManager::swap_in_sequence)
         .def("release_sequence", &KVCacheManager::release_sequence)

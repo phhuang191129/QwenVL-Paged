@@ -188,23 +188,26 @@ there is exactly one file to read.
 
 ### 4.1 `BlockShape` and `PhysicalBlock` — one frame of memory
 
-`BlockShape` (`include/qwenvl_paged/Block.h`) is five numbers that describe a
+`BlockShape` (`include/qwenvl_paged/Block.h`) is six numbers that describe a
 block, and `byte_size()` turns them into a byte count:
 
 *`src/Block.cpp`*
 
 ```cpp
 std::size_t BlockShape::byte_size() const noexcept {
-    // A full block stores both the K and V streams for every layer, head, and
-    // token slot, hence the factor of two.
-    return static_cast<std::size_t>(tokens_per_block) * num_layers *
+    return static_cast<std::size_t>(tokens_per_block) * frame_layers() *
            num_kv_heads * head_dim * bytes_per_element * 2u;
 }
 ```
 
-Note what one block holds: **all layers**, both K and V, for `tokens_per_block`
-consecutive token positions. A sequence does not get one block per layer; it
-gets one block per 16 tokens, and that block is internally sliced by layer.
+The default (`layers_per_frame == 0`) stores **all layers**, both K and V, for
+`tokens_per_block` consecutive token positions in one frame. A sequence then
+gets one block per 16 tokens, internally sliced by layer. Setting
+`layers_per_frame = 1` stores one layer per frame; the same token span then
+needs `num_layers` frames, allocated layer-major so one layer's frames sit
+next to each other. The allocator is unchanged: it still hands out frames of
+`byte_size()`. Serving and replay stay on the default so existing pool counts
+remain valid.
 
 `PhysicalBlock` owns the bytes with a `unique_ptr` and a custom deleter,
 allocated through `std::aligned_alloc` at 256-byte alignment by default. The
@@ -226,7 +229,9 @@ A block is just bytes. `KVBlockLayout` says how those bytes are ordered:
 outermost                             innermost
 ```
 
-The strides fall straight out of that ordering
+When `layers_per_frame == 1` a frame only stores layer 0 of that ordering;
+`CacheView::slot` picks the layer's block table and calls `element_offset`
+with layer 0. The strides fall straight out of that ordering
 (`src/CacheLayout.cpp`), all counted in **elements**, not bytes:
 
 | Stride | Value | Meaning |
@@ -1242,8 +1247,9 @@ ordering: a frame may not be recycled while a kernel still reads it, so
 
 **"What would you do next?"**
 The CPU decode kernel is 2.4–3.0× the scalar oracle and still 4–11× under
-the 35 GB/s DRAM roof. The isolated paging tax at image length is 2.43×
-(stride inside a 1.75 MiB block, not the page walk). Week 12's thread pool
-stays closed until one thread is near that roof. A layer-major store layout
-would remove the tax without touching the allocator.
+the 35 GB/s DRAM roof. A layer-major store (`layers_per_frame = 1`) matches
+packed 1-layer frames when the 5 MiB of one layer stays resident, and falls
+into the same ~2.4× slow mode week 11 reported as a paging tax. Week 12's
+thread pool stays closed. The comparison against vLLM's block manager is in
+[`vllm-comparison.md`](vllm-comparison.md).
 

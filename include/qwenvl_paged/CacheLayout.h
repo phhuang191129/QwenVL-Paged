@@ -30,9 +30,9 @@ inline constexpr std::uint32_t kKVStreamCount = 2;
  *     [layer][K|V][token_in_block][kv_head][head_dim]
  *
  * with `head_dim` innermost, so the whole K (or V) vector of one token and one
- * head is contiguous. That is the access pattern of the reference attention
- * loop, and it is also the granularity at which a CUDA or Triton kernel would
- * want to issue a vectorized load.
+ * head is contiguous. When `BlockShape::layers_per_frame == 1` a physical
+ * frame stores only one layer; `CacheView` picks the layer's block table and
+ * calls `element_offset` with layer 0.
  *
  * All strides and offsets are counted in *elements*, not bytes. Multiply by
  * `BlockShape::bytes_per_element` for a byte offset.

@@ -19,7 +19,7 @@ std::size_t KVBlockLayout::layer_stride() const noexcept {
 }
 
 std::size_t KVBlockLayout::element_count() const noexcept {
-    return static_cast<std::size_t>(shape.num_layers) * layer_stride();
+    return static_cast<std::size_t>(shape.frame_layers()) * layer_stride();
 }
 
 std::optional<std::size_t> KVBlockLayout::element_offset(
@@ -27,7 +27,8 @@ std::optional<std::size_t> KVBlockLayout::element_offset(
     KVStream stream,
     std::uint32_t token_in_block,
     std::uint32_t kv_head) const noexcept {
-    if (layer >= shape.num_layers || token_in_block >= shape.tokens_per_block ||
+    const std::uint32_t stored_layers = shape.frame_layers();
+    if (layer >= stored_layers || token_in_block >= shape.tokens_per_block ||
         kv_head >= shape.num_kv_heads) {
         return std::nullopt;
     }

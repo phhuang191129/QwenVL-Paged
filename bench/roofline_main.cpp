@@ -36,6 +36,7 @@ namespace {
 
 using qwenvl_paged::AllocatorConfig;
 using qwenvl_paged::BlockShape;
+using qwenvl_paged::CacheKind;
 using qwenvl_paged::CacheView;
 using qwenvl_paged::KVBlockLayout;
 using qwenvl_paged::KVCacheManager;
@@ -272,7 +273,8 @@ bool fill_sequence(
     MemoryAllocator& allocator,
     KVBlockLayout layout,
     std::uint64_t sequence_id,
-    std::uint32_t context_len) {
+    std::uint32_t context_len,
+    std::uint32_t fill_layers = 0) {
     if (!cache.create_sequence(SequenceMetadata{sequence_id, sequence_id, {}, {}})) {
         return false;
     }
@@ -280,26 +282,36 @@ bool fill_sequence(
         return false;
     }
     const BlockShape& shape = layout.shape;
+    const bool per_layer = shape.per_layer_frames();
+    const std::uint32_t layers_to_write =
+        fill_layers == 0 || fill_layers > shape.num_layers ? shape.num_layers : fill_layers;
     for (std::uint32_t token = 0; token < context_len; ++token) {
-        const std::optional<PhysicalBlockId> physical = cache.ensure_token_writable(sequence_id, token);
-        if (!physical.has_value()) {
-            return false;
-        }
-        PhysicalBlock* block = allocator.block(*physical);
-        if (block == nullptr) {
-            return false;
-        }
-        auto* base = reinterpret_cast<std::uint16_t*>(block->data());
-        for (std::uint32_t layer = 0; layer < shape.num_layers; ++layer) {
-            for (KVStream stream : {KVStream::Key, KVStream::Value}) {
-                for (std::uint32_t head = 0; head < shape.num_kv_heads; ++head) {
-                    const auto offset =
-                        layout.element_offset(layer, stream, token % shape.tokens_per_block, head);
-                    if (!offset.has_value()) {
-                        return false;
-                    }
-                    for (std::uint32_t d = 0; d < shape.head_dim; ++d) {
-                        base[*offset + d] = static_cast<std::uint16_t>(token + head + d);
+        const std::uint32_t ensure_layers = per_layer ? layers_to_write : 1;
+        for (std::uint32_t ensure_layer = 0; ensure_layer < ensure_layers; ++ensure_layer) {
+            const std::optional<PhysicalBlockId> physical = cache.ensure_token_writable(
+                sequence_id, token, CacheKind::TextKV, ensure_layer);
+            if (!physical.has_value()) {
+                return false;
+            }
+            PhysicalBlock* block = allocator.block(*physical);
+            if (block == nullptr) {
+                return false;
+            }
+            auto* base = reinterpret_cast<std::uint16_t*>(block->data());
+            const std::uint32_t write_from = per_layer ? ensure_layer : 0;
+            const std::uint32_t write_to = per_layer ? ensure_layer + 1 : layers_to_write;
+            for (std::uint32_t layer = write_from; layer < write_to; ++layer) {
+                const std::uint32_t offset_layer = per_layer ? 0 : layer;
+                for (KVStream stream : {KVStream::Key, KVStream::Value}) {
+                    for (std::uint32_t head = 0; head < shape.num_kv_heads; ++head) {
+                        const auto offset = layout.element_offset(
+                            offset_layer, stream, token % shape.tokens_per_block, head);
+                        if (!offset.has_value()) {
+                            return false;
+                        }
+                        for (std::uint32_t d = 0; d < shape.head_dim; ++d) {
+                            base[*offset + d] = static_cast<std::uint16_t>(token + head + d);
+                        }
                     }
                 }
             }
@@ -458,6 +470,74 @@ void bench_attention(Csv& csv) {
         packed_flops,
         packed_stats,
         "1-layer frames; paging tax vs fast ctx 1280");
+
+    // Same 28-layer model, one layer per frame, allocated layer-major so
+    // layer 0's 80 frames sit next to each other instead of 1.75 MiB apart.
+    BlockShape layer_major = shape;
+    layer_major.layers_per_frame = 1;
+    AllocatorConfig layer_config;
+    layer_config.block_shape = layer_major;
+    layer_config.max_blocks = needed_blocks * shape.num_layers;
+    MemoryAllocator layer_allocator(layer_config);
+    KVCacheManager layer_cache(layer_allocator);
+    KVBlockLayout layer_layout;
+    layer_layout.shape = layer_major;
+    if (!fill_sequence(layer_cache, layer_allocator, layer_layout, 1, 1280)) {
+        std::cerr << "failed to populate layer-major attention cache\n";
+        return;
+    }
+    const std::optional<CacheView> layer_view = layer_cache.cache_view(1);
+    if (!layer_view.has_value()) {
+        return;
+    }
+    PagedAttentionParams layer_params = packed_params;
+    const auto layer_stats = qwenvl_bench::measure_body(
+        [&]() {
+            if (!qwenvl_paged::paged_attention_decode_fast<std::uint16_t>(
+                    *layer_view, query.data(), layer_params, out.data())) {
+                std::cerr << "layer-major fast decode failed\n";
+                std::exit(1);
+            }
+        },
+        kWarmup,
+        kRepeats);
+    csv.row(
+        "attention_decode",
+        "fast ctx 1280 layer-major",
+        packed_bytes,
+        packed_flops,
+        layer_stats,
+        "28 layers, 1 layer/frame, layer-major reserve");
+
+    // Same 140 MiB pool, but only layer 0 is written, so a miss here is the
+    // layout rather than the other 27 layers evicting L3 during fill.
+    MemoryAllocator layer0_allocator(layer_config);
+    KVCacheManager layer0_cache(layer0_allocator);
+    if (!fill_sequence(layer0_cache, layer0_allocator, layer_layout, 1, 1280, 1)) {
+        std::cerr << "failed to populate layer-major L0-only cache\n";
+        return;
+    }
+    const std::optional<CacheView> layer0_view = layer0_cache.cache_view(1);
+    if (!layer0_view.has_value()) {
+        return;
+    }
+    const auto layer0_stats = qwenvl_bench::measure_body(
+        [&]() {
+            if (!qwenvl_paged::paged_attention_decode_fast<std::uint16_t>(
+                    *layer0_view, query.data(), layer_params, out.data())) {
+                std::cerr << "layer-major L0-only fast decode failed\n";
+                std::exit(1);
+            }
+        },
+        kWarmup,
+        kRepeats);
+    csv.row(
+        "attention_decode",
+        "fast ctx 1280 layer-major L0-only",
+        packed_bytes,
+        packed_flops,
+        layer0_stats,
+        "28-layer pool, only layer 0 filled");
 }
 
 } // namespace

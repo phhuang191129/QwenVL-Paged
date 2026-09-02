@@ -96,6 +96,7 @@ struct CacheView {
     SequenceId sequence_id{0};
     CacheKind cache_kind{CacheKind::TextKV};
     const BlockTable* block_table{nullptr};
+    const std::vector<BlockTable>* layer_tables{nullptr};
     const MemoryAllocator* allocator{nullptr};
     KVBlockLayout layout{};
 
@@ -111,6 +112,7 @@ struct CacheView {
      * out, so a backend faults instead of reading a recycled frame.
      */
     [[nodiscard]] const std::byte* block_bytes(LogicalBlockIndex index) const noexcept;
+    [[nodiscard]] const std::byte* block_bytes(LogicalBlockIndex index, std::uint32_t layer) const noexcept;
 
     /**
      * @brief Resolves one (stream, layer, token, kv head) vector in the cache.
@@ -140,13 +142,19 @@ const T* CacheView::slot(
     }
 
     const std::uint32_t tokens_per_block = layout.shape.tokens_per_block;
+    const bool per_layer = layout.shape.per_layer_frames();
+    if (per_layer && (layer_tables == nullptr || layer >= layer_tables->size())) {
+        return nullptr;
+    }
+    const std::uint32_t offset_layer = per_layer ? 0 : layer;
     const std::optional<std::size_t> offset =
-        layout.element_offset(layer, stream, token % tokens_per_block, kv_head);
+        layout.element_offset(offset_layer, stream, token % tokens_per_block, kv_head);
     if (!offset.has_value()) {
         return nullptr;
     }
 
-    const std::byte* bytes = block_bytes(static_cast<LogicalBlockIndex>(token / tokens_per_block));
+    const LogicalBlockIndex index = static_cast<LogicalBlockIndex>(token / tokens_per_block);
+    const std::byte* bytes = per_layer ? block_bytes(index, layer) : block_bytes(index);
     if (bytes == nullptr) {
         return nullptr;
     }
@@ -203,7 +211,8 @@ public:
     [[nodiscard]] std::optional<PhysicalBlockId> ensure_token_writable(
         SequenceId sequence_id,
         TokenPosition token_position,
-        CacheKind cache_kind = CacheKind::TextKV);
+        CacheKind cache_kind = CacheKind::TextKV,
+        std::uint32_t layer = 0);
 
     /**
      * @brief Evicts a sequence's cache blocks to the allocator's swap backend.
@@ -294,10 +303,16 @@ public:
 private:
     struct SequenceState {
         SequenceMetadata metadata{};
-        BlockTable text_table;
+        std::vector<BlockTable> tables;
         std::string prefix_key;
         std::uint64_t prefix_hash{0};
+
+        BlockTable& text_table() { return tables.front(); }
+        const BlockTable& text_table() const { return tables.front(); }
     };
+
+    [[nodiscard]] BlockShape pool_shape() const noexcept;
+    [[nodiscard]] std::uint32_t table_count() const noexcept;
 
     struct PrefixRecord {
         std::uint64_t content_hash{0};
@@ -311,6 +326,7 @@ private:
     void drop_prefix_user(SequenceState& state);
     [[nodiscard]] std::uint32_t tokens_per_block() const noexcept;
     [[nodiscard]] std::uint64_t content_hash_of(const BlockTable& table) const;
+    [[nodiscard]] std::uint64_t content_hash_of(const std::vector<BlockTable>& tables) const;
 
     MemoryAllocator* allocator_{nullptr};
     std::unordered_map<SequenceId, SequenceState> sequences_;

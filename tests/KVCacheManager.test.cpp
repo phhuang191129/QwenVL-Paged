@@ -471,6 +471,53 @@ TEST(KVCacheManagerTest, PrefixReleaseOfOneSharerLeavesTheOther) {
     EXPECT_EQ(manager.prefix_token_count("shared"), 0u);
 }
 
+TEST(KVCacheManagerTest, PerLayerReserveAllocatesOneFramePerLayerAndPacksLayerMajor) {
+    AllocatorConfig config = make_allocator_config(16);
+    config.block_shape.layers_per_frame = 1;
+    MemoryAllocator allocator(config);
+    KVCacheManager manager(allocator);
+    ASSERT_TRUE(manager.create_sequence(make_metadata(1)));
+    ASSERT_TRUE(manager.reserve_tokens(1, kTokensPerBlock * 2));
+
+    EXPECT_EQ(allocator.stats().free_blocks, 12u);
+
+    const std::optional<CacheView> view = manager.cache_view(1);
+    ASSERT_TRUE(view.has_value());
+    ASSERT_NE(view->layer_tables, nullptr);
+    ASSERT_EQ(view->layer_tables->size(), 2u);
+    EXPECT_EQ(view->block_table->size(), 2u);
+    EXPECT_EQ((*view->layer_tables)[1].size(), 2u);
+
+    const PhysicalBlockId l0_0 = *(*view->layer_tables)[0].lookup(0);
+    const PhysicalBlockId l0_1 = *(*view->layer_tables)[0].lookup(1);
+    const PhysicalBlockId l1_0 = *(*view->layer_tables)[1].lookup(0);
+    // The free list pops descending ids, so a bulk reserve packs as n, n-1, ...
+    EXPECT_EQ(l0_0, l0_1 + 1);
+    EXPECT_EQ(l0_1, l1_0 + 1);
+}
+
+TEST(KVCacheManagerTest, PerLayerPrefixAttachMapsEveryLayer) {
+    AllocatorConfig config = make_allocator_config(16);
+    config.block_shape.layers_per_frame = 1;
+    MemoryAllocator allocator(config);
+    KVCacheManager manager(allocator);
+    ASSERT_TRUE(manager.create_sequence(make_metadata(1, 1)));
+    ASSERT_TRUE(manager.reserve_tokens(1, kTokensPerBlock));
+    fill_block(*allocator.block(*manager.cache_view(1)->layer_tables->front().lookup(0)), 11);
+    fill_block(*allocator.block(*(*manager.cache_view(1)->layer_tables)[1].lookup(0)), 12);
+
+    ASSERT_TRUE(manager.publish_prefix(1, "per-layer"));
+    ASSERT_TRUE(manager.create_sequence(make_metadata(2, 2)));
+    EXPECT_EQ(manager.attach_prefix(2, "per-layer"), kTokensPerBlock);
+
+    const std::optional<CacheView> parent = manager.cache_view(1);
+    const std::optional<CacheView> child = manager.cache_view(2);
+    ASSERT_TRUE(parent.has_value());
+    ASSERT_TRUE(child.has_value());
+    EXPECT_EQ((*child->layer_tables)[0].lookup(0), (*parent->layer_tables)[0].lookup(0));
+    EXPECT_EQ((*child->layer_tables)[1].lookup(0), (*parent->layer_tables)[1].lookup(0));
+}
+
 TEST(KVCacheManagerTest, SharedPrefixProducesIdenticalAttention) {
     AllocatorConfig config = make_allocator_config();
     config.block_shape.bytes_per_element = static_cast<std::uint32_t>(sizeof(float));

@@ -63,7 +63,15 @@ bool write_head_vector(
     TokenPosition token,
     std::uint32_t kv_head,
     float value) {
-    const std::optional<PhysicalBlockId> physical = cache.ensure_token_writable(sequence_id, token);
+    const PhysicalBlock* probe = allocator.block(0);
+    if (probe == nullptr) {
+        return false;
+    }
+    KVBlockLayout layout;
+    layout.shape = probe->shape();
+    const bool per_layer = layout.shape.per_layer_frames();
+    const std::optional<PhysicalBlockId> physical = cache.ensure_token_writable(
+        sequence_id, token, CacheKind::TextKV, per_layer ? layer : 0);
     if (!physical.has_value()) {
         return false;
     }
@@ -73,9 +81,8 @@ bool write_head_vector(
         return false;
     }
 
-    const KVBlockLayout layout = make_layout();
-    const std::optional<std::size_t> offset =
-        layout.element_offset(layer, stream, token % kTokensPerBlock, kv_head);
+    const std::optional<std::size_t> offset = layout.element_offset(
+        per_layer ? 0 : layer, stream, token % kTokensPerBlock, kv_head);
     if (!offset.has_value()) {
         return false;
     }
@@ -171,6 +178,16 @@ TEST(KVBlockLayoutTest, RejectsOutOfRangeCoordinates) {
     EXPECT_FALSE(layout.element_offset(kNumLayers, KVStream::Key, 0, 0).has_value());
     EXPECT_FALSE(layout.element_offset(0, KVStream::Key, kTokensPerBlock, 0).has_value());
     EXPECT_FALSE(layout.element_offset(0, KVStream::Key, 0, kNumKvHeads).has_value());
+}
+
+TEST(KVBlockLayoutTest, OneLayerFrameStoresOnlyLayerZero) {
+    KVBlockLayout layout = make_layout();
+    layout.shape.layers_per_frame = 1;
+
+    EXPECT_EQ(layout.element_count(), layout.layer_stride());
+    EXPECT_EQ(layout.element_count() * layout.shape.bytes_per_element, layout.shape.byte_size());
+    EXPECT_TRUE(layout.element_offset(0, KVStream::Key, 0, 0).has_value());
+    EXPECT_FALSE(layout.element_offset(1, KVStream::Key, 0, 0).has_value());
 }
 
 // --- CacheView -----------------------------------------------------------
@@ -329,6 +346,53 @@ TEST_F(CacheViewTest, SlotFollowsCopyOnWriteRemapping) {
     EXPECT_NE(parent_slot, child_slot);
     EXPECT_FLOAT_EQ(parent_slot[0], 7.0F);
     EXPECT_FLOAT_EQ(child_slot[0], 9.0F);
+}
+
+TEST(CacheViewPerLayerTest, SlotReadsEachLayerFromItsOwnFrame) {
+    AllocatorConfig config = make_allocator_config(8);
+    config.block_shape.layers_per_frame = 1;
+    MemoryAllocator allocator(config);
+    KVCacheManager cache(allocator);
+    ASSERT_TRUE(cache.create_sequence(SequenceMetadata{1, 1, {}, {}}));
+    ASSERT_TRUE(cache.reserve_tokens(1, kTokensPerBlock));
+
+    ASSERT_TRUE(write_head_vector(cache, allocator, 1, KVStream::Key, 0, 1, 0, 11.0F));
+    ASSERT_TRUE(write_head_vector(cache, allocator, 1, KVStream::Key, 1, 1, 0, 33.0F));
+
+    const std::optional<CacheView> view = cache.cache_view(1);
+    ASSERT_TRUE(view.has_value());
+    ASSERT_NE(view->layer_tables, nullptr);
+    EXPECT_EQ(view->layer_tables->size(), kNumLayers);
+    EXPECT_NE(view->block_bytes(0, 0), view->block_bytes(0, 1));
+    EXPECT_FLOAT_EQ(view->slot<float>(KVStream::Key, 0, 1, 0)[0], 11.0F);
+    EXPECT_FLOAT_EQ(view->slot<float>(KVStream::Key, 1, 1, 0)[0], 33.0F);
+}
+
+TEST(CacheViewPerLayerTest, CopyOnWriteRemapsOnlyTheWrittenLayer) {
+    AllocatorConfig config = make_allocator_config(8);
+    config.block_shape.layers_per_frame = 1;
+    MemoryAllocator allocator(config);
+    KVCacheManager cache(allocator);
+    ASSERT_TRUE(cache.create_sequence(SequenceMetadata{1, 1, {}, {}}));
+    ASSERT_TRUE(cache.reserve_tokens(1, kTokensPerBlock));
+    ASSERT_TRUE(write_head_vector(cache, allocator, 1, KVStream::Key, 0, 0, 0, 7.0F));
+    ASSERT_TRUE(write_head_vector(cache, allocator, 1, KVStream::Key, 1, 0, 0, 8.0F));
+    ASSERT_TRUE(cache.fork_sequence(1, SequenceMetadata{2, 1, {}, {}}));
+
+    ASSERT_TRUE(write_head_vector(cache, allocator, 2, KVStream::Key, 0, 0, 0, 9.0F));
+
+    const std::optional<CacheView> parent = cache.cache_view(1);
+    const std::optional<CacheView> child = cache.cache_view(2);
+    ASSERT_TRUE(parent.has_value());
+    ASSERT_TRUE(child.has_value());
+
+    EXPECT_NE(
+        parent->slot<float>(KVStream::Key, 0, 0, 0), child->slot<float>(KVStream::Key, 0, 0, 0));
+    EXPECT_EQ(
+        parent->slot<float>(KVStream::Key, 1, 0, 0), child->slot<float>(KVStream::Key, 1, 0, 0));
+    EXPECT_FLOAT_EQ(parent->slot<float>(KVStream::Key, 0, 0, 0)[0], 7.0F);
+    EXPECT_FLOAT_EQ(child->slot<float>(KVStream::Key, 0, 0, 0)[0], 9.0F);
+    EXPECT_FLOAT_EQ(child->slot<float>(KVStream::Key, 1, 0, 0)[0], 8.0F);
 }
 
 } // namespace

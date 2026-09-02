@@ -602,10 +602,7 @@ GPU-ready in four specific places; this phase is where that claim is tested.
   re-implements from scratch what vLLM does in production. Documenting where the
   designs agree, where they differ, and why is a piece of analysis that requires
   having built both mental models — and it is the strongest interview asset here.
-- **Upstream contribution.** Two candidate targets, in order of likely success:
-  a reproducible Qwen3-VL serving recipe in the style of `vllm-project/recipes`,
-  or a small well-scoped fix found while reading vLLM's or SGLang's block manager
-  for the comparative study. The review conversation matters more than the merge.
+
 
 ---
 

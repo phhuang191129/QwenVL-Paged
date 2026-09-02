@@ -48,6 +48,26 @@ struct BlockShape {
     std::uint32_t num_kv_heads{0};
     std::uint32_t head_dim{0};
     std::uint32_t bytes_per_element{0};
+    /**
+     * @brief Layers stored in one physical frame. Zero means `num_layers`
+     *        (every layer in one frame). Set to 1 for layer-major packing:
+     *        one frame holds one layer's K/V for `tokens_per_block` tokens.
+     */
+    std::uint32_t layers_per_frame{0};
+
+    /**
+     * @brief Layers actually stored in one allocated frame.
+     */
+    [[nodiscard]] std::uint32_t frame_layers() const noexcept {
+        return layers_per_frame == 0 ? num_layers : layers_per_frame;
+    }
+
+    /**
+     * @brief True when each physical frame holds a single layer.
+     */
+    [[nodiscard]] bool per_layer_frames() const noexcept {
+        return frame_layers() == 1 && num_layers > 1;
+    }
 
     /**
      * @brief Returns the number of bytes needed by a full K/V cache block.

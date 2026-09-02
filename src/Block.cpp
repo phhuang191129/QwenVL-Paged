@@ -5,7 +5,7 @@ namespace qwenvl_paged {
 std::size_t BlockShape::byte_size() const noexcept {
     // A full block stores both the K and V streams for every layer, head, and
     // token slot, hence the factor of two.
-    return static_cast<std::size_t>(tokens_per_block) * num_layers *
+    return static_cast<std::size_t>(tokens_per_block) * frame_layers() *
            num_kv_heads * head_dim * bytes_per_element * 2u;
 }
 

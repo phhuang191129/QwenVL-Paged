@@ -10,13 +10,22 @@ bool CacheView::valid() const noexcept {
 }
 
 const std::byte* CacheView::block_bytes(LogicalBlockIndex index) const noexcept {
+    return block_bytes(index, 0);
+}
+
+const std::byte* CacheView::block_bytes(LogicalBlockIndex index, std::uint32_t layer) const noexcept {
     if (!valid()) {
         return nullptr;
     }
 
-    // lookup already faults on a swapped-out entry, whose frame went back to the
-    // free list and may now belong to another sequence.
-    const std::optional<PhysicalBlockId> physical = block_table->lookup(index);
+    const BlockTable* table = block_table;
+    if (layer_tables != nullptr && layer < layer_tables->size()) {
+        table = &(*layer_tables)[layer];
+    } else if (layer != 0) {
+        return nullptr;
+    }
+
+    const std::optional<PhysicalBlockId> physical = table->lookup(index);
     if (!physical.has_value()) {
         return nullptr;
     }
@@ -26,6 +35,16 @@ const std::byte* CacheView::block_bytes(LogicalBlockIndex index) const noexcept 
 }
 
 KVCacheManager::KVCacheManager(MemoryAllocator& allocator) : allocator_(&allocator) {}
+
+BlockShape KVCacheManager::pool_shape() const noexcept {
+    const PhysicalBlock* block = allocator_->block(0);
+    return block == nullptr ? BlockShape{} : block->shape();
+}
+
+std::uint32_t KVCacheManager::table_count() const noexcept {
+    const BlockShape shape = pool_shape();
+    return shape.per_layer_frames() ? shape.num_layers : 1;
+}
 
 void KVCacheManager::index_sequence(RequestId request_id, SequenceId sequence_id) {
     sequences_by_request_[request_id].push_back(sequence_id);
@@ -63,6 +82,18 @@ std::uint64_t KVCacheManager::content_hash_of(const BlockTable& table) const {
             hash ^= static_cast<std::uint64_t>(bytes[i]);
             hash *= 1099511628211ULL;
         }
+    }
+    return hash;
+}
+
+std::uint64_t KVCacheManager::content_hash_of(const std::vector<BlockTable>& tables) const {
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const BlockTable& table : tables) {
+        // Mix table hashes in layer-major order so a 1-layer-per-frame prefix
+        // is not interchangeable with an all-layers-in-one-frame prefix.
+        const std::uint64_t table_hash = content_hash_of(table);
+        hash ^= table_hash;
+        hash *= 1099511628211ULL;
     }
     return hash;
 }
@@ -109,7 +140,14 @@ bool KVCacheManager::create_sequence(SequenceMetadata metadata) {
     }
 
     const RequestId request_id = metadata.request_id;
-    sequences_.emplace(sequence_id, SequenceState{std::move(metadata), BlockTable(sequence_id), {}, 0});
+    SequenceState state;
+    state.metadata = std::move(metadata);
+    const std::uint32_t tables = table_count();
+    state.tables.reserve(tables);
+    for (std::uint32_t i = 0; i < tables; ++i) {
+        state.tables.emplace_back(sequence_id);
+    }
+    sequences_.emplace(sequence_id, std::move(state));
     index_sequence(request_id, sequence_id);
     return true;
 }
@@ -125,19 +163,27 @@ bool KVCacheManager::fork_sequence(SequenceId parent_id, SequenceMetadata child_
         return false;
     }
 
-    for (const BlockTableEntry& entry : parent_it->second.text_table.entries()) {
-        if (entry.swap_slot.has_value()) {
-            return false;
+    for (const BlockTable& table : parent_it->second.tables) {
+        for (const BlockTableEntry& entry : table.entries()) {
+            if (entry.swap_slot.has_value()) {
+                return false;
+            }
         }
     }
 
-    BlockTable child_table = parent_it->second.text_table.fork(child_id);
-    for (const BlockTableEntry& entry : child_table.entries()) {
-        allocator_->retain(entry.physical_id);
+    SequenceState child;
+    child.metadata = std::move(child_metadata);
+    child.tables.reserve(parent_it->second.tables.size());
+    for (const BlockTable& table : parent_it->second.tables) {
+        BlockTable forked = table.fork(child_id);
+        for (const BlockTableEntry& entry : forked.entries()) {
+            allocator_->retain(entry.physical_id);
+        }
+        child.tables.push_back(std::move(forked));
     }
 
-    const RequestId request_id = child_metadata.request_id;
-    sequences_.emplace(child_id, SequenceState{std::move(child_metadata), std::move(child_table), {}, 0});
+    const RequestId request_id = child.metadata.request_id;
+    sequences_.emplace(child_id, std::move(child));
     index_sequence(request_id, child_id);
     return true;
 }
@@ -156,39 +202,50 @@ bool KVCacheManager::reserve_tokens(SequenceId sequence_id, std::uint32_t token_
     }
 
     const std::uint32_t blocks_needed = (token_count + tokens_per_block - 1) / tokens_per_block;
-    if (!allocator_->can_allocate(blocks_needed)) {
+    const std::uint32_t frames_needed =
+        blocks_needed * static_cast<std::uint32_t>(it->second.tables.size());
+    if (!allocator_->can_allocate(frames_needed)) {
         return false;
     }
 
-    BlockTable& table = it->second.text_table;
-    const LogicalBlockIndex base_index = static_cast<LogicalBlockIndex>(table.size());
-    for (std::uint32_t offset = 0; offset < blocks_needed; ++offset) {
-        const std::optional<PhysicalBlockId> physical = allocator_->allocate();
-        if (!physical.has_value()) {
-            return false;
-        }
+    // Layer-major: fill each layer's table completely before the next, so a
+    // bulk reserve packs one layer's frames next to each other in the pool.
+    for (BlockTable& table : it->second.tables) {
+        const LogicalBlockIndex base_index = static_cast<LogicalBlockIndex>(table.size());
+        for (std::uint32_t offset = 0; offset < blocks_needed; ++offset) {
+            const std::optional<PhysicalBlockId> physical = allocator_->allocate();
+            if (!physical.has_value()) {
+                return false;
+            }
 
-        const LogicalBlockIndex index = base_index + offset;
-        LogicalBlock logical;
-        logical.sequence_id = sequence_id;
-        logical.index = index;
-        logical.cache_kind = table.cache_kind();
-        logical.start_token = index * tokens_per_block;
-        logical.token_count = tokens_per_block;
-        table.map(logical, *physical, true);
+            const LogicalBlockIndex index = base_index + offset;
+            LogicalBlock logical;
+            logical.sequence_id = sequence_id;
+            logical.index = index;
+            logical.cache_kind = table.cache_kind();
+            logical.start_token = index * tokens_per_block;
+            logical.token_count = tokens_per_block;
+            table.map(logical, *physical, true);
+        }
     }
 
     return true;
 }
 
 std::optional<PhysicalBlockId> KVCacheManager::ensure_token_writable(
-    SequenceId sequence_id, TokenPosition token_position, CacheKind /*cache_kind*/) {
+    SequenceId sequence_id,
+    TokenPosition token_position,
+    CacheKind /*cache_kind*/,
+    std::uint32_t layer) {
     auto it = sequences_.find(sequence_id);
-    if (it == sequences_.end()) {
+    if (it == sequences_.end() || it->second.tables.empty()) {
         return std::nullopt;
     }
 
-    BlockTable& table = it->second.text_table;
+    if (layer >= it->second.tables.size()) {
+        return std::nullopt;
+    }
+    BlockTable& table = it->second.tables[layer];
     if (table.empty()) {
         return std::nullopt;
     }
@@ -236,28 +293,29 @@ std::uint32_t KVCacheManager::swap_out_sequence(SequenceId sequence_id) {
         return 0;
     }
 
-    BlockTable& table = it->second.text_table;
-    std::vector<LogicalBlockIndex> resident;
-    for (const BlockTableEntry& entry : table.entries()) {
-        if (!entry.swap_slot.has_value()) {
-            resident.push_back(entry.logical.index);
-        }
-    }
-
     std::uint32_t swapped = 0;
-    for (const LogicalBlockIndex index : resident) {
-        BlockTableEntry* entry = table.mutable_entry(index);
-        if (entry == nullptr) {
-            continue;
+    for (BlockTable& table : it->second.tables) {
+        std::vector<LogicalBlockIndex> resident;
+        for (const BlockTableEntry& entry : table.entries()) {
+            if (!entry.swap_slot.has_value()) {
+                resident.push_back(entry.logical.index);
+            }
         }
 
-        const std::optional<SwapSlotId> slot = allocator_->swap_out(entry->physical_id);
-        if (!slot.has_value()) {
-            continue;
-        }
+        for (const LogicalBlockIndex index : resident) {
+            BlockTableEntry* entry = table.mutable_entry(index);
+            if (entry == nullptr) {
+                continue;
+            }
 
-        entry->swap_slot = slot;
-        ++swapped;
+            const std::optional<SwapSlotId> slot = allocator_->swap_out(entry->physical_id);
+            if (!slot.has_value()) {
+                continue;
+            }
+
+            entry->swap_slot = slot;
+            ++swapped;
+        }
     }
 
     return swapped;
@@ -269,34 +327,38 @@ bool KVCacheManager::swap_in_sequence(SequenceId sequence_id) {
         return false;
     }
 
-    BlockTable& table = it->second.text_table;
-    std::vector<LogicalBlockIndex> swapped;
-    for (const BlockTableEntry& entry : table.entries()) {
-        if (entry.swap_slot.has_value()) {
-            swapped.push_back(entry.logical.index);
+    std::uint32_t needed = 0;
+    for (const BlockTable& table : it->second.tables) {
+        for (const BlockTableEntry& entry : table.entries()) {
+            if (entry.swap_slot.has_value()) {
+                ++needed;
+            }
         }
     }
-
-    if (swapped.empty()) {
+    if (needed == 0) {
         return true;
     }
-    if (!allocator_->can_allocate(static_cast<std::uint32_t>(swapped.size()))) {
+    if (!allocator_->can_allocate(needed)) {
         return false;
     }
 
-    for (const LogicalBlockIndex index : swapped) {
-        BlockTableEntry* entry = table.mutable_entry(index);
-        if (entry == nullptr) {
-            continue;
+    for (BlockTable& table : it->second.tables) {
+        for (const BlockTableEntry& entry : table.entries()) {
+            if (!entry.swap_slot.has_value()) {
+                continue;
+            }
+            BlockTableEntry* mutable_entry = table.mutable_entry(entry.logical.index);
+            if (mutable_entry == nullptr) {
+                return false;
+            }
+            const std::optional<PhysicalBlockId> restored =
+                allocator_->swap_in(*mutable_entry->swap_slot);
+            if (!restored.has_value()) {
+                return false;
+            }
+            mutable_entry->physical_id = *restored;
+            mutable_entry->swap_slot.reset();
         }
-
-        const std::optional<PhysicalBlockId> restored = allocator_->swap_in(*entry->swap_slot);
-        if (!restored.has_value()) {
-            return false;
-        }
-
-        entry->physical_id = *restored;
-        entry->swap_slot.reset();
     }
 
     return true;
@@ -310,11 +372,13 @@ void KVCacheManager::release_sequence(SequenceId sequence_id) {
 
     drop_prefix_user(it->second);
 
-    for (const BlockTableEntry& entry : it->second.text_table.entries()) {
-        if (entry.swap_slot.has_value()) {
-            allocator_->discard_swapped(*entry.swap_slot);
-        } else {
-            allocator_->release(entry.physical_id);
+    for (const BlockTable& table : it->second.tables) {
+        for (const BlockTableEntry& entry : table.entries()) {
+            if (entry.swap_slot.has_value()) {
+                allocator_->discard_swapped(*entry.swap_slot);
+            } else {
+                allocator_->release(entry.physical_id);
+            }
         }
     }
     unindex_sequence(it->second.metadata.request_id, sequence_id);
@@ -345,9 +409,11 @@ bool KVCacheManager::swap_in_request(RequestId request_id) {
         if (it == sequences_.end()) {
             continue;
         }
-        for (const BlockTableEntry& entry : it->second.text_table.entries()) {
-            if (entry.swap_slot.has_value()) {
-                ++needed;
+        for (const BlockTable& table : it->second.tables) {
+            for (const BlockTableEntry& entry : table.entries()) {
+                if (entry.swap_slot.has_value()) {
+                    ++needed;
+                }
             }
         }
     }
@@ -385,7 +451,7 @@ bool KVCacheManager::publish_prefix(SequenceId sequence_id, const std::string& k
         return false;
     }
     auto it = sequences_.find(sequence_id);
-    if (it == sequences_.end() || it->second.text_table.empty()) {
+    if (it == sequences_.end() || it->second.text_table().empty()) {
         return false;
     }
     if (it->second.prefix_key == key) {
@@ -398,14 +464,16 @@ bool KVCacheManager::publish_prefix(SequenceId sequence_id, const std::string& k
     }
 
     PrefixRecord record;
-    record.content_hash = content_hash_of(it->second.text_table);
-    record.token_count = static_cast<std::uint32_t>(it->second.text_table.size()) * tpb;
+    record.content_hash = content_hash_of(it->second.tables);
+    record.token_count = static_cast<std::uint32_t>(it->second.text_table().size()) * tpb;
     record.users = 1;
-    for (const BlockTableEntry& entry : it->second.text_table.entries()) {
-        if (entry.swap_slot.has_value()) {
-            return false;
+    for (const BlockTable& table : it->second.tables) {
+        for (const BlockTableEntry& entry : table.entries()) {
+            if (entry.swap_slot.has_value()) {
+                return false;
+            }
+            record.physical_ids.push_back(entry.physical_id);
         }
-        record.physical_ids.push_back(entry.physical_id);
     }
 
     auto& records = prefix_index_[key];
@@ -432,7 +500,7 @@ std::uint32_t KVCacheManager::attach_prefix(SequenceId sequence_id, const std::s
         return 0;
     }
     auto it = sequences_.find(sequence_id);
-    if (it == sequences_.end() || !it->second.text_table.empty()) {
+    if (it == sequences_.end() || !it->second.text_table().empty()) {
         return 0;
     }
 
@@ -443,20 +511,28 @@ std::uint32_t KVCacheManager::attach_prefix(SequenceId sequence_id, const std::s
 
     PrefixRecord& record = pit->second.front();
     const std::uint32_t tpb = tokens_per_block();
-    if (tpb == 0 || record.physical_ids.empty()) {
+    const std::size_t n_tables = it->second.tables.size();
+    if (tpb == 0 || record.physical_ids.empty() || n_tables == 0) {
+        return 0;
+    }
+    if (record.physical_ids.size() % n_tables != 0) {
         return 0;
     }
 
-    BlockTable& table = it->second.text_table;
-    for (std::size_t i = 0; i < record.physical_ids.size(); ++i) {
-        allocator_->retain(record.physical_ids[i]);
-        LogicalBlock logical;
-        logical.sequence_id = sequence_id;
-        logical.index = static_cast<LogicalBlockIndex>(i);
-        logical.cache_kind = table.cache_kind();
-        logical.start_token = static_cast<TokenPosition>(i * tpb);
-        logical.token_count = tpb;
-        table.map(logical, record.physical_ids[i], false);
+    const std::size_t ids_per_table = record.physical_ids.size() / n_tables;
+    std::size_t id_index = 0;
+    for (BlockTable& table : it->second.tables) {
+        for (std::size_t i = 0; i < ids_per_table; ++i) {
+            allocator_->retain(record.physical_ids[id_index]);
+            LogicalBlock logical;
+            logical.sequence_id = sequence_id;
+            logical.index = static_cast<LogicalBlockIndex>(i);
+            logical.cache_kind = table.cache_kind();
+            logical.start_token = static_cast<TokenPosition>(i * tpb);
+            logical.token_count = tpb;
+            table.map(logical, record.physical_ids[id_index], false);
+            ++id_index;
+        }
     }
     ++record.users;
     it->second.prefix_key = key;
@@ -473,7 +549,8 @@ std::optional<CacheView> KVCacheManager::cache_view(SequenceId sequence_id, Cach
     CacheView view;
     view.sequence_id = sequence_id;
     view.cache_kind = cache_kind;
-    view.block_table = &it->second.text_table;
+    view.block_table = &it->second.text_table();
+    view.layer_tables = &it->second.tables;
     view.allocator = allocator_;
     if (const PhysicalBlock* block = allocator_->block(0); block != nullptr) {
         view.layout.shape = block->shape();
