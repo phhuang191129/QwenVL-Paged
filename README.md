@@ -62,8 +62,7 @@ ownership, and KV-cache policy so each layer can evolve independently:
 | `CacheView`        | Read-only kernel contract: page table + storage + layout.             |
 
 For the full design, boundaries, concurrency contract, and phased plan, see
-[`docs/architecture.md`](docs/architecture.md).
-
+[`docs/architecture.md`](docs/architecture.md). 
 > **Concurrency:** the phase-1 core is single-threaded by contract. All mutation
 > must happen on one engine event loop; reference counts and free-list updates
 > are deliberately non-atomic. See the architecture doc before sharing these
@@ -93,6 +92,8 @@ traces/                 Generated request traces (JSONL)
 fixtures/               Golden attention vectors (.npz) shared by both backends
 results/                Measured CSV output backing docs/performance.md
 docs/architecture.md    Design document and phased roadmap
+docs/system-design-walkthrough.md   Memory subsystem architecture walkthrough
+docs/kernel-optimization-walkthrough.md CPU & GPU kernel optimization walkthrough
 docs/roadmap-phase2.md  Weeks 9-16: Qwen3-VL integration, profiling, optimization
 docs/performance.md     Measured results, with assumptions and limitations
 CMakeLists.txt          Build and test configuration
